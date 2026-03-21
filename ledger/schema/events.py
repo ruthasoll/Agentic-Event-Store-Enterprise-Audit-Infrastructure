@@ -162,6 +162,30 @@ class CreditDecision(BaseModel):
     policy_overrides_applied: list[str] = Field(default_factory=list)
 
 
+# ─── STORAGE MODELS ───────────────────────────────────────────────────────────
+
+class StoredEvent(BaseModel):
+    """Enveloped event as stored in the database."""
+    event_id: UUID
+    stream_id: str
+    stream_position: int
+    global_position: int | None = None
+    event_type: str
+    event_version: int
+    payload: dict[str, Any]
+    metadata: dict[str, Any]
+    recorded_at: datetime
+
+class StreamMetadata(BaseModel):
+    """Metadata about an event stream."""
+    stream_id: str
+    aggregate_type: str
+    current_version: int
+    created_at: datetime
+    archived_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 # ─── BASE EVENT ───────────────────────────────────────────────────────────────
 
 class BaseEvent(BaseModel):

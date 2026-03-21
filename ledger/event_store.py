@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import AsyncGenerator
 from uuid import UUID
 import asyncpg
+from ledger.schema.events import StoredEvent, StreamMetadata
 
 
 class OptimisticConcurrencyError(Exception):
@@ -123,6 +124,9 @@ class EventStore:
                 if current != expected_version:
                     raise OptimisticConcurrencyError(stream_id, expected_version, current)
 
+                if row and row.get("archived_at"):
+                    raise ValueError(f"Stream '{stream_id}' is archived and cannot be appended to.")
+
                 # 3. Create stream if new
                 if row is None:
                     await conn.execute(
@@ -186,7 +190,7 @@ class EventStore:
                 e = {**dict(row), "payload": json.loads(row["payload"]),
                                    "metadata": json.loads(row["metadata"])}
                 if self.upcasters: e = self.upcasters.upcast(e)
-                events.append(e)
+                events.append(StoredEvent(**e))
             return events
 
     async def load_all(
@@ -210,7 +214,8 @@ class EventStore:
                 for row in rows:
                     e = {**dict(row), "payload": json.loads(row["payload"]),
                                        "metadata": json.loads(row["metadata"])}
-                    yield e
+                    if self.upcasters: e = self.upcasters.upcast(e)
+                    yield StoredEvent(**e)
                 pos = rows[-1]["global_position"]
                 if len(rows) < batch_size: break
 
@@ -223,8 +228,52 @@ class EventStore:
             row = await conn.fetchrow(
                 "SELECT * FROM events WHERE event_id=$1", event_id)
             if not row: return None
-            return {**dict(row), "payload": json.loads(row["payload"]),
-                                  "metadata": json.loads(row["metadata"])}
+            return StoredEvent(**{**dict(row), "payload": json.loads(row["payload"]),
+                                  "metadata": json.loads(row["metadata"])})
+
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
+        """
+        Returns metadata for an event stream.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM event_streams WHERE stream_id = $1",
+                stream_id)
+            if not row: return None
+            return StreamMetadata(
+                stream_id=row["stream_id"],
+                aggregate_type=row["aggregate_type"],
+                current_version=row["current_version"],
+                created_at=row["created_at"],
+                archived_at=row["archived_at"],
+                metadata=json.loads(row["metadata"])
+            )
+
+    async def archive_stream(self, stream_id: str, expected_version: int) -> None:
+        """
+        Archives a stream, preventing further appends.
+        Respects OCC to ensure we archive the version we think we are archiving.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Lock and check version
+                row = await conn.fetchrow(
+                    "SELECT current_version, archived_at FROM event_streams "
+                    "WHERE stream_id = $1 FOR UPDATE", stream_id)
+                
+                if not row:
+                    raise ValueError(f"Stream '{stream_id}' not found.")
+                
+                if row["archived_at"]:
+                    return # Already archived
+                
+                if row["current_version"] != expected_version:
+                    raise OptimisticConcurrencyError(stream_id, expected_version, row["current_version"])
+                
+                # 2. Set archived_at
+                await conn.execute(
+                    "UPDATE event_streams SET archived_at = $1 WHERE stream_id = $2",
+                    datetime.utcnow(), stream_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,82 +328,6 @@ class UpcasterRegistry:
 # IN-MEMORY EVENT STORE — for tests only
 # ─────────────────────────────────────────────────────────────────────────────
 
-class InMemoryEventStore:
-    """
-    In-memory event store for unit tests. No database required.
-    Identical interface to EventStore — swap transparently in conftest.py.
-
-    Your Phase 1 tests use this. Once EventStore is implemented and a test
-    database is available, you can run all tests against the real store too.
-    """
-
-    def __init__(self, upcaster_registry=None):
-        self.upcasters = upcaster_registry
-        self._streams: dict[str, list[dict]] = {}   # stream_id → [event_dict, ...]
-        self._global: list[dict] = []               # all events in global order
-
-    async def stream_version(self, stream_id: str) -> int:
-        events = self._streams.get(stream_id, [])
-        return len(events) - 1  # -1 if empty, 0-based index otherwise
-
-    async def append(
-        self,
-        stream_id: str,
-        events: list[dict],
-        expected_version: int,
-        causation_id: str | None = None,
-        metadata: dict | None = None,
-    ) -> list[int]:
-        current = await self.stream_version(stream_id)
-        if current != expected_version:
-            raise OptimisticConcurrencyError(stream_id, expected_version, current)
-
-        self._streams.setdefault(stream_id, [])
-        positions = []
-        for i, event in enumerate(events):
-            pos = expected_version + 1 + i
-            stored = {
-                "event_id": str(__import__("uuid").uuid4()),
-                "stream_id": stream_id,
-                "stream_position": pos,
-                "global_position": len(self._global),
-                "event_type": event["event_type"],
-                "event_version": event.get("event_version", 1),
-                "payload": dict(event.get("payload", {})),
-                "metadata": {**(metadata or {}), **({"causation_id": causation_id} if causation_id else {})},
-                "recorded_at": __import__("datetime").datetime.utcnow(),
-            }
-            self._streams[stream_id].append(stored)
-            self._global.append(stored)
-            positions.append(pos)
-        return positions
-
-    async def load_stream(
-        self,
-        stream_id: str,
-        from_position: int = 0,
-        to_position: int | None = None,
-    ) -> list[dict]:
-        events = self._streams.get(stream_id, [])
-        result = [e for e in events if e["stream_position"] >= from_position]
-        if to_position is not None:
-            result = [e for e in result if e["stream_position"] <= to_position]
-        if self.upcasters:
-            result = [self.upcasters.upcast(dict(e)) for e in result]
-        return result
-
-    async def load_all(
-        self, from_position: int = 0, batch_size: int = 500
-    ):
-        for event in self._global:
-            if event["global_position"] >= from_position:
-                yield dict(event)
-
-    async def get_event(self, event_id) -> dict | None:
-        for event in self._global:
-            if event["event_id"] == str(event_id):
-                return dict(event)
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -385,6 +358,8 @@ class InMemoryEventStore:
         self._checkpoints: dict[str, int] = {}
         # asyncio lock per stream for OCC
         self._locks: dict[str, _asyncio.Lock] = _defaultdict(_asyncio.Lock)
+        # stream_id -> archived_at (datetime)
+        self._archived: dict[str, _datetime] = {}
 
     async def stream_version(self, stream_id: str) -> int:
         return self._versions.get(stream_id, 0)
@@ -401,6 +376,9 @@ class InMemoryEventStore:
             current = self._versions.get(stream_id, 0)
             if current != expected_version:
                 raise OptimisticConcurrencyError(stream_id, expected_version, current)
+
+            if self._archived.get(stream_id):
+                raise ValueError(f"Stream '{stream_id}' is archived and cannot be appended to.")
 
             positions = []
             meta = {**(metadata or {})}
@@ -432,24 +410,53 @@ class InMemoryEventStore:
         stream_id: str,
         from_position: int = 0,
         to_position: int | None = None,
-    ) -> list[dict]:
+    ) -> list[StoredEvent]:
         events = [
             e for e in self._streams.get(stream_id, [])
             if e["stream_position"] >= from_position
             and (to_position is None or e["stream_position"] <= to_position)
         ]
-        return sorted(events, key=lambda e: e["stream_position"])
+        return [StoredEvent(**e) for e in sorted(events, key=lambda e: e["stream_position"])]
 
     async def load_all(self, from_position: int = 0, batch_size: int = 500):
         for e in self._global:
             if e["global_position"] >= from_position:
-                yield e
+                yield StoredEvent(**e)
 
-    async def get_event(self, event_id: str) -> dict | None:
+    async def get_event(self, event_id: str) -> StoredEvent | None:
         for e in self._global:
-            if e["event_id"] == event_id:
-                return e
+            if e["event_id"] == str(event_id):
+                return StoredEvent(**e)
         return None
+
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
+        async with self._locks[stream_id]:
+            if stream_id not in self._streams:
+                return None
+            
+            # Find first event for created_at
+            events = self._streams[stream_id]
+            created_at = events[0]["recorded_at"] if events else _datetime.utcnow()
+            
+            return StreamMetadata(
+                stream_id=stream_id,
+                aggregate_type=stream_id.split("-")[0],
+                current_version=self._versions.get(stream_id, 0),
+                created_at=created_at,
+                archived_at=self._archived.get(stream_id),
+                metadata={}
+            )
+
+    async def archive_stream(self, stream_id: str, expected_version: int) -> None:
+        async with self._locks[stream_id]:
+            current = self._versions.get(stream_id, 0)
+            if current != expected_version:
+                raise OptimisticConcurrencyError(stream_id, expected_version, current)
+            
+            if self._archived.get(stream_id):
+                return
+            
+            self._archived[stream_id] = _datetime.utcnow()
 
     async def save_checkpoint(self, projection_name: str, position: int) -> None:
         self._checkpoints[projection_name] = position
