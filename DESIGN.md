@@ -31,15 +31,19 @@ With 100 loans/min, that's 400 agents. Assuming they converge on their respectiv
 - `confidence_score` -> Set to `null`. *Why not infer?* If we calculate an average confidence (e.g., 0.8) and insert it, an auditor will assume the model generated 0.8 confidence. This is data fabrication and constitutes a severe compliance violation. Null correctly represents "the model did not emit a confidence score at the time".
 - `regulatory_basis` -> Set to `[]`. Reconstructing complex regulation rules retroactively poses a massive risk of hallucinating compliance where none existed.
 
-## 5. EventStoreDB Comparison
-Mapping PostgreSQL schema concepts to EventStoreDB:
-- **Streams:** The same. EventStoreDB natively uses stream IDs (`loan-123`).
-- **events table:** EventStoreDB handles this internally; events are appended natively without defining JSONB schemas.
-- **event_version:** In EventStoreDB, metadata headers accompany events, often driving the upcaster logic in application space.
-- **load_all():** EventStoreDB provides the `$all` stream. Reading `$all` is highly optimized via gRPC persistent subscriptions or catch-up subscriptions.
-- **ProjectionDaemon (Async):** EventStoreDB gives us *Persistent Subscriptions* built explicitly to track checkpoints, handle consumer groups, and implement reliable retries without us needing to manage `projection_checkpoints` explicitly in Postgres.
+## 5. Enterprise Stack Translation (Marten/Wolverine & EventStoreDB)
+For clients with an existing stack preference, our bespoke implementation maps cleanly to enterprise frameworks.
 
-*What EventStoreDB gives us:* We must work hard to poll PostgreSQL efficiently (e.g., using `LISTEN/NOTIFY` plus table scans and locking `projection_checkpoints`). EventStoreDB manages cursor tracking, catch-up subscriptions, and native fan-out completely out-of-the-box.
+**Mapping to Marten + Wolverine (.NET)**
+- **Event Append (OCC):** Our `ExpectedVersion` OCC strategy maps 1:1 to Marten's `Append` method using optimistic concurrency exceptions (`ExpectedVersion.Any`, `ExpectedVersion.NoStream`, or an explicit version integer).
+- **Projections:** Our async Python `ProjectionDaemon` is natively handled by Marten's Async Daemon. The Wolverine service bus can act as our `Outbox`, natively routing domain events emitted by agents into persistent background queues for downstream handlers.
+- **Aggregates:** Our Python base aggregate classes and `_apply()` routing translate directly into Marten's `AggregateStream` and static `Apply()` methods in C#.
+
+**Mapping to EventStoreDB:**
+- **Streams:** The same. EventStoreDB natively uses stream IDs (e.g., `loan-123`).
+- **Events Table:** EventStoreDB handles this internally; events are appended natively via gRPC without defining JSONB structured PostgreSQL tables.
+- **Load_All() / Projection Daemon:** Our manual polling against `global_position` is replaced by EventStoreDB's `$all` stream. Reading `$all` is highly optimized via Catch-Up Subscriptions or Persistent Subscriptions for consumer group fault tolerance.
+- **Event Metadata:** In EventStoreDB, metadata headers accompany events, natively driving upcaster logic and causation/correlation IDs across distributed agents.
 
 ## 6. What You Would Do Differently
 **The single most significant architectural decision to reconsider:** 
