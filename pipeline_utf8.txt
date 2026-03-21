@@ -1,0 +1,6 @@
+﻿Processing APEX-0007 through phase: all
+--- Running DocumentProcessingAgent ---
+Document processing complete! Verified Output written to Events.
+
+--- Running CreditAnalysisAgent ---
+Credit analysis failed: 

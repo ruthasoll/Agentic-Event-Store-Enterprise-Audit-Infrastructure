@@ -1,0 +1,32 @@
+Traceback (most recent call last):
+  File "C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure\scripts\run_pipeline.py", line 51, in main
+    res = await credit_graph.ainvoke(initial)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\pregel\main.py", line 3158, in ainvoke
+    async for chunk in self.astream(
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\pregel\main.py", line 2971, in astream
+    async for _ in runner.atick(
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\pregel\_runner.py", line 304, in atick
+    await arun_with_retry(
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\pregel\_retry.py", line 137, in arun_with_retry
+    return await task.proc.ainvoke(task.input, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\_internal\_runnable.py", line 705, in ainvoke
+    input = await asyncio.create_task(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ruths\AppData\Roaming\Python\Python312\site-packages\langgraph\_internal\_runnable.py", line 473, in ainvoke
+    ret = await self.afunc(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\agents\credit_analysis_agent.py", line 232, in _node_load_registry
+    profile   = await self.registry.get_company(applicant_id) or {}
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\registry\client.py", line 52, in get_company
+    raise NotImplementedError
+NotImplementedError
+During task with name 'load_applicant_registry' and id '3982231c-528e-588d-fa6d-b525d675c7f5'
+Processing APEX-0007 through phase: all
+--- Running DocumentProcessingAgent ---
+Document processing complete! Verified Output written to Events.
+
+--- Running CreditAnalysisAgent ---
+Credit analysis failed: 

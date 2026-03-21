@@ -46,33 +46,48 @@ class ApplicantRegistryClient:
 
     async def get_company(self, company_id: str) -> CompanyProfile | None:
         """
-        TODO: implement
         SELECT * FROM applicant_registry.companies WHERE company_id = $1
         """
-        raise NotImplementedError
+        row = await self._pool.fetchrow(
+            "SELECT * FROM applicant_registry.companies WHERE company_id = $1", 
+            company_id
+        )
+        return dict(row) if row else None
 
     async def get_financial_history(self, company_id: str,
                                      years: list[int] | None = None) -> list[FinancialYear]:
         """
-        TODO: implement
         SELECT * FROM applicant_registry.financial_history
         WHERE company_id = $1 [AND fiscal_year = ANY($2)]
         ORDER BY fiscal_year ASC
         """
-        raise NotImplementedError
+        query = "SELECT * FROM applicant_registry.financial_history WHERE company_id = $1"
+        params = [company_id]
+        if years:
+            query += " AND fiscal_year = ANY($2)"
+            params.append(years)
+        query += " ORDER BY fiscal_year ASC"
+        rows = await self._pool.fetch(query, *params)
+        return [dict(r) for r in rows]
 
     async def get_compliance_flags(self, company_id: str,
                                     active_only: bool = False) -> list[ComplianceFlag]:
         """
-        TODO: implement
         SELECT * FROM applicant_registry.compliance_flags
         WHERE company_id = $1 [AND is_active = TRUE]
         """
-        raise NotImplementedError
+        query = "SELECT * FROM applicant_registry.compliance_flags WHERE company_id = $1"
+        if active_only:
+            query += " AND is_active = TRUE"
+        rows = await self._pool.fetch(query, company_id)
+        return [dict(r) for r in rows]
 
     async def get_loan_relationships(self, company_id: str) -> list[dict]:
         """
-        TODO: implement
         SELECT * FROM applicant_registry.loan_relationships WHERE company_id = $1
         """
-        raise NotImplementedError
+        rows = await self._pool.fetch(
+            "SELECT * FROM applicant_registry.loan_relationships WHERE company_id = $1", 
+            company_id
+        )
+        return [dict(r) for r in rows]
