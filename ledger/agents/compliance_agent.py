@@ -17,7 +17,7 @@ from ledger.agents.base_agent import BaseApexAgent
 from ledger.schema.events import (
     ComplianceCheckInitiated, ComplianceRulePassed, ComplianceRuleFailed,
     ComplianceRuleNoted, ComplianceCheckCompleted,
-    DecisionRequested, ApplicationDeclined, AdverseActionNotice
+    DecisionRequested, ApplicationDeclined, AgentType, ComplianceVerdict
 )
 
 class ComplianceState(TypedDict):
@@ -94,7 +94,7 @@ REGULATIONS = {
 
 class ComplianceAgent(BaseApexAgent):
     def __init__(self, agent_id: str, store, registry, model_version="compliance-v1"):
-        super().__init__(agent_id, store, model_version=model_version)
+        super().__init__(agent_id, AgentType.COMPLIANCE, store, model_version=model_version)
         self.registry = registry
 
     async def _append_with_retry(self, stream_id: str, events: list, causation_id: str = None) -> list[int]:
@@ -122,12 +122,20 @@ class ComplianceAgent(BaseApexAgent):
         g = StateGraph(ComplianceState)
         g.add_node("validate_inputs",     self._node_validate_inputs)
         g.add_node("load_company_profile",self._node_load_profile)
-        g.add_node("evaluate_reg001",     lambda s: self._evaluate_rule(s, "REG-001"))
-        g.add_node("evaluate_reg002",     lambda s: self._evaluate_rule(s, "REG-002"))
-        g.add_node("evaluate_reg003",     lambda s: self._evaluate_rule(s, "REG-003"))
-        g.add_node("evaluate_reg004",     lambda s: self._evaluate_rule(s, "REG-004"))
-        g.add_node("evaluate_reg005",     lambda s: self._evaluate_rule(s, "REG-005"))
-        g.add_node("evaluate_reg006",     lambda s: self._evaluate_rule(s, "REG-006"))
+        
+        async def node_reg001(s): return await self._evaluate_rule(s, "REG-001")
+        async def node_reg002(s): return await self._evaluate_rule(s, "REG-002")
+        async def node_reg003(s): return await self._evaluate_rule(s, "REG-003")
+        async def node_reg004(s): return await self._evaluate_rule(s, "REG-004")
+        async def node_reg005(s): return await self._evaluate_rule(s, "REG-005")
+        async def node_reg006(s): return await self._evaluate_rule(s, "REG-006")
+        
+        g.add_node("evaluate_reg001",     node_reg001)
+        g.add_node("evaluate_reg002",     node_reg002)
+        g.add_node("evaluate_reg003",     node_reg003)
+        g.add_node("evaluate_reg004",     node_reg004)
+        g.add_node("evaluate_reg005",     node_reg005)
+        g.add_node("evaluate_reg006",     node_reg006)
         g.add_node("write_output",        self._node_write_output)
 
         g.set_entry_point("validate_inputs")
@@ -165,6 +173,8 @@ class ComplianceAgent(BaseApexAgent):
         event = ComplianceCheckInitiated(
             application_id=app_id,
             session_id=self.session_id,
+            regulation_set_version="1.0.0",
+            rules_to_evaluate=["BSA_KNOW_YOUR_CUSTOMER", "OFAC_SANCTIONS", "AML_MONITORING", "CREDIT_HISTORY_CHECK", "IDENTITY_VERIFICATION", "FRAUD_REGISTRY_CHECK"],
             initiated_at=datetime.now(),
         ).to_store_dict()
         await self._append_with_retry(f"compliance-{app_id}", [event])
@@ -209,22 +219,27 @@ class ComplianceAgent(BaseApexAgent):
         if rule_id == "REG-006":
             event = ComplianceRuleNoted(
                 application_id=app_id, session_id=self.session_id,
-                rule_id=rule_id, note_type=reg["note_type"], note_text=reg["note_text"],
-                evidence_hash=evidence_hash, noted_at=datetime.now()
+                rule_id=rule_id, rule_name=reg["name"], note_type=reg["note_type"], note_text=reg["note_text"],
+                evaluated_at=datetime.now()
             )
             results.append({"rule_id": rule_id, "status": "NOTED"})
         elif passes:
             event = ComplianceRulePassed(
                 application_id=app_id, session_id=self.session_id,
-                rule_id=rule_id, evidence_hash=evidence_hash, passed_at=datetime.now()
+                rule_id=rule_id, rule_name=reg["name"], rule_version=reg["version"],
+                evidence_hash=evidence_hash, evaluation_notes="Rule criteria met.",
+                evaluated_at=datetime.now()
             )
             results.append({"rule_id": rule_id, "status": "PASSED"})
         else:
             event = ComplianceRuleFailed(
                 application_id=app_id, session_id=self.session_id,
-                rule_id=rule_id, failure_reason=reg["failure_reason"],
-                remediation_required=reg["remediation"],
-                evidence_hash=evidence_hash, failed_at=datetime.now()
+                rule_id=rule_id, rule_name=reg["name"], rule_version=reg["version"],
+                failure_reason=reg["failure_reason"],
+                is_hard_block=reg.get("is_hard_block", False),
+                remediation_available=bool(reg.get("remediation")),
+                remediation_description=reg.get("remediation"),
+                evidence_hash=evidence_hash, evaluated_at=datetime.now()
             )
             results.append({"rule_id": rule_id, "status": "FAILED"})
             if reg.get("is_hard_block"):
@@ -244,17 +259,21 @@ class ComplianceAgent(BaseApexAgent):
         t = time.time()
         app_id = state["application_id"]
         has_block = state.get("has_hard_block", False)
+        
+        results = state.get("rule_results", [])
+        rules_passed = len([r for r in results if r["status"] == "PASSED"])
+        rules_failed = len([r for r in results if r["status"] == "FAILED"])
+        rules_noted  = len([r for r in results if r["status"] == "NOTED"])
 
         completed_event = ComplianceCheckCompleted(
             application_id=app_id,
             session_id=self.session_id,
-            checks_passed=len([r for r in state.get("rule_results", []) if r["status"] == "PASSED"]),
-            checks_failed=len([r for r in state.get("rule_results", []) if r["status"] == "FAILED"]),
-            hard_block_triggered=has_block,
-            model_version=self.model_version,
-            model_deployment_id=f"dep-{uuid4().hex[:8]}",
-            input_data_hash=self._sha(state),
-            analysis_duration_ms=int((time.time() - t) * 1000),
+            rules_evaluated=len(results),
+            rules_passed=rules_passed,
+            rules_failed=rules_failed,
+            rules_noted=rules_noted,
+            has_hard_block=has_block,
+            overall_verdict=ComplianceVerdict.BLOCKED if has_block else ComplianceVerdict.CLEAR,
             completed_at=datetime.now()
         ).to_store_dict()
         positions = await self._append_with_retry(f"compliance-{app_id}", [completed_event])
@@ -262,26 +281,22 @@ class ComplianceAgent(BaseApexAgent):
         output_events = [{"stream_id": f"compliance-{app_id}", "event_type": "ComplianceCheckCompleted", "stream_position": positions[0] if positions else -1}]
 
         if has_block:
-            adverse = AdverseActionNotice(
-                reason_code=state.get("block_rule_id", "REG-UNKNOWN"),
-                description=REGULATIONS.get(state.get("block_rule_id"), {}).get("failure_reason", "Compliance block"),
-                regulatory_basis=[state.get("block_rule_id", "")]
-            )
-            decline_event = ApplicationDeclined(
+            ev = ApplicationDeclined(
                 application_id=app_id,
-                declined_by_event_id=self.session_id,
-                reason="Auto-declined due to hard regulatory compliance block.",
+                decline_reasons=[REGULATIONS.get(state.get("block_rule_id"), {}).get("failure_reason", "Compliance block")],
+                declined_by=self.session_id,
                 adverse_action_notice_required=True,
-                adverse_action_details=adverse,
+                adverse_action_codes=[state.get("block_rule_id", "REG-UNKNOWN")],
                 declined_at=datetime.now()
             ).to_store_dict()
-            await self._append_with_retry(f"loan-{app_id}", [decline_event])
+            await self._append_with_retry(f"loan-{app_id}", [ev])
             output_events.append({"stream_id": f"loan-{app_id}", "event_type": "ApplicationDeclined", "stream_position": -1})
             next_agent = None
         else:
             decision_event = DecisionRequested(
                 application_id=app_id,
                 requested_at=datetime.now(),
+                all_analyses_complete=True,
                 triggered_by_event_id=self.session_id
             ).to_store_dict()
             await self._append_with_retry(f"loan-{app_id}", [decision_event])

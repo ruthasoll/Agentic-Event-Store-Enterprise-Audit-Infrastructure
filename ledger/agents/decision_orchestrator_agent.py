@@ -15,7 +15,7 @@ from langgraph.graph import StateGraph, END
 from ledger.agents.base_agent import BaseApexAgent
 from ledger.schema.events import (
     DecisionGenerated, ApplicationApproved, ApplicationDeclined,
-    HumanReviewRequested, OrchestratorDecision, AdverseActionNotice
+    HumanReviewRequested, AgentType
 )
 
 class OrchestratorState(TypedDict):
@@ -36,7 +36,7 @@ class OrchestratorState(TypedDict):
 
 class DecisionOrchestratorAgent(BaseApexAgent):
     def __init__(self, agent_id: str, store, model_version="orchestrator-v1"):
-        super().__init__(agent_id, store, model_version=model_version)
+        super().__init__(agent_id, AgentType.DECISION_ORCHESTRATOR, store, model_version=model_version)
 
     async def _append_with_retry(self, stream_id: str, events: list, causation_id: str = None) -> list[int]:
         max_retries = 3
@@ -222,51 +222,44 @@ class DecisionOrchestratorAgent(BaseApexAgent):
         app_id = state["application_id"]
         rec = state.get("recommendation")
         
-        dec = OrchestratorDecision(
-            recommendation=rec,
-            approved_amount_usd=float(state.get("approved_amount") or 0.0),
-            confidence=state.get("confidence") or 0.5,
-            executive_summary=state.get("executive_summary") or "",
-            conditions=state.get("conditions") or [],
-            policy_overrides_applied=state.get("hard_constraints_applied") or []
-        )
-        
-        event = DecisionGenerated(
+        dec_gen_event = DecisionGenerated(
             application_id=app_id,
-            session_id=self.session_id,
-            decision=dec,
-            model_version=self.model_version,
-            model_deployment_id=f"dep-{uuid4().hex[:8]}",
-            input_data_hash=self._sha(state),
-            logic_duration_ms=int((time.time() - t) * 1000),
+            orchestrator_session_id=self.session_id,
+            recommendation=rec,
+            confidence=state.get("confidence") or 0.5,
+            approved_amount_usd=float(state.get("approved_amount") or 0.0),
+            conditions=state.get("conditions") or [],
+            executive_summary=state.get("executive_summary") or "",
+            key_risks=state.get("hard_constraints_applied", []) or [],
+            contributing_sessions=[],
+            model_versions={"orchestrator": self.model_version},
             generated_at=datetime.now()
         ).to_store_dict()
         
-        positions = await self._append_with_retry(f"loan-{app_id}", [event])
+        positions = await self._append_with_retry(f"loan-{app_id}", [dec_gen_event])
         events_written = [{"stream_id": f"loan-{app_id}", "event_type": "DecisionGenerated", "stream_position": positions[0] if positions else -1}]
-
+        decision_event_id = str(uuid4()) # For the ID ref
+        
         if rec == "APPROVE":
             ev = ApplicationApproved(
                 application_id=app_id,
-                approved_by_event_id=self.session_id,
-                approved_amount_usd=dec.approved_amount_usd,
-                conditions=dec.conditions,
+                approved_amount_usd=float(state.get("approved_amount") or 0.0),
+                interest_rate_pct=5.5,
+                term_months=36,
+                conditions=state.get("conditions") or [],
+                approved_by=self.session_id,
+                effective_date=datetime.now().strftime("%Y-%m-%d"),
                 approved_at=datetime.now()
             ).to_store_dict()
             await self._append_with_retry(f"loan-{app_id}", [ev])
             events_written.append({"stream_id": f"loan-{app_id}", "event_type": "ApplicationApproved", "stream_position": -1})
         elif rec == "DECLINE":
-            adverse = AdverseActionNotice(
-                reason_code="DECISION_ORCHESTRATOR_DECLINE",
-                description="Failed multi-agent bounds.",
-                regulatory_basis=[]
-            )
             ev = ApplicationDeclined(
                 application_id=app_id,
-                declined_by_event_id=self.session_id,
-                reason="Auto-declined due to Orchestrator bounds.",
+                decline_reasons=["Auto-declined due to Orchestrator bounds."],
+                declined_by=self.session_id,
                 adverse_action_notice_required=True,
-                adverse_action_details=adverse,
+                adverse_action_codes=["DECISION_ORCHESTRATOR_DECLINE"],
                 declined_at=datetime.now()
             ).to_store_dict()
             await self._append_with_retry(f"loan-{app_id}", [ev])
@@ -274,8 +267,8 @@ class DecisionOrchestratorAgent(BaseApexAgent):
         elif rec == "REFER":
             ev = HumanReviewRequested(
                 application_id=app_id,
-                requested_by_event_id=self.session_id,
-                reason_for_review="Orchestrator referral constraints triggered.",
+                reason="Orchestrator referral constraints triggered.",
+                decision_event_id=self.session_id,
                 requested_at=datetime.now()
             ).to_store_dict()
             await self._append_with_retry(f"loan-{app_id}", [ev])

@@ -14,8 +14,8 @@ from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
 from ledger.schema.events import (
-    FraudScreeningInitiated, FraudAnomalyDetected, FraudScreeningCompleted,
-    ComplianceCheckRequested, FraudAssessment
+    FraudScreeningInitiated, FraudAnomalyDetected, FraudAnomaly, FraudScreeningCompleted,
+    ComplianceCheckRequested, AgentType
 )
 
 class FraudState(TypedDict):
@@ -33,7 +33,7 @@ class FraudState(TypedDict):
 
 class FraudDetectionAgent(BaseApexAgent):
     def __init__(self, agent_id: str, store, registry, model_version="fraud-v1"):
-        super().__init__(agent_id, store, model_version=model_version)
+        super().__init__(agent_id, AgentType.FRAUD_DETECTION, store, model_version=model_version)
         self.registry = registry
 
     async def _append_with_retry(self, stream_id: str, events: list, causation_id: str = None) -> list[int]:
@@ -93,22 +93,17 @@ class FraudDetectionAgent(BaseApexAgent):
         app_id = state["application_id"]
         
         # Initiate Fraud Screening
-        credit_events = await self.store.load_stream(f"credit-{app_id}")
-        credit_completed = [e for e in credit_events if e["event_type"] == "CreditAnalysisCompleted"]
-        errors = []
-        if not credit_completed:
-            errors.append("Expected CreditAnalysisCompleted before Fraud Screening")
-            
         event = FraudScreeningInitiated(
             application_id=app_id,
             session_id=self.session_id,
+            screening_model_version=self.model_version,
             initiated_at=datetime.now(),
         ).to_store_dict()
         await self._append_with_retry(f"fraud-{app_id}", [event])
 
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution("validate_inputs", ["application_id"], ["fraud_screening_initiated"], ms, correlation_id=self.session_id)
-        return {**state, "errors": errors}
+        return state
 
     async def _node_load_facts(self, state: FraudState) -> FraudState:
         t = time.time()
@@ -163,21 +158,24 @@ class FraudDetectionAgent(BaseApexAgent):
                 if gap > 0.40 and trajectory not in ["GROWTH", "RECOVERING"]:
                     fraud_score += 0.25
                     anomalies.append({
-                        "anomaly_type": "REVENUE_DISCREPANCY",
+                        "anomaly_type": "revenue_discrepancy",
                         "severity": "HIGH",
                         "evidence": f"Revenue deviates {gap:.0%} from prior year under {trajectory} trajectory",
                         "affected_fields": ["total_revenue"]
                     })
 
         # Append anomaly detected events
-        for anomaly in anomalies:
+        for anom_dict in anomalies:
             event = FraudAnomalyDetected(
                 application_id=app_id,
                 session_id=self.session_id,
-                anomaly_type=anomaly["anomaly_type"],
-                severity=anomaly["severity"],
-                evidence=anomaly["evidence"],
-                affected_fields=anomaly["affected_fields"],
+                anomaly=FraudAnomaly(
+                    anomaly_type=anom_dict["anomaly_type"],
+                    description=anom_dict["evidence"],
+                    severity=anom_dict["severity"],
+                    evidence=anom_dict["evidence"],
+                    affected_fields=anom_dict["affected_fields"]
+                ),
                 detected_at=datetime.now()
             ).to_store_dict()
             await self._append_with_retry(f"fraud-{app_id}", [event])
@@ -198,21 +196,15 @@ class FraudDetectionAgent(BaseApexAgent):
         else:
             rec = "PROCEED"
 
-        assessment = FraudAssessment(
-            fraud_score=fraud_score,
-            recommendation=rec,
-            primary_anomalies_detected=[a["anomaly_type"] for a in state.get("anomalies", [])],
-            justification="System cross-checks resolved successfully."
-        )
-
         completed_event = FraudScreeningCompleted(
             application_id=app_id,
             session_id=self.session_id,
-            assessment=assessment,
-            model_version=self.model_version,
-            model_deployment_id=f"dep-{uuid4().hex[:8]}",
+            fraud_score=fraud_score,
+            risk_level="HIGH" if fraud_score > 0.60 else "MEDIUM" if fraud_score > 0.30 else "LOW",
+            anomalies_found=len(state.get("anomalies", [])),
+            recommendation=rec,
+            screening_model_version=self.model_version,
             input_data_hash=self._sha(state),
-            analysis_duration_ms=int((time.time() - t) * 1000),
             completed_at=datetime.now()
         ).to_store_dict()
         positions = await self._append_with_retry(f"fraud-{app_id}", [completed_event])
@@ -220,7 +212,9 @@ class FraudDetectionAgent(BaseApexAgent):
         compliance_trigger = ComplianceCheckRequested(
             application_id=app_id,
             requested_at=datetime.now(),
-            triggered_by_event_id=self.session_id
+            triggered_by_event_id=self.session_id,
+            regulation_set_version="2026-Q1-v1",
+            rules_to_evaluate=["REG-001", "REG-002", "REG-003", "REG-004", "REG-005", "REG-006"]
         ).to_store_dict()
         await self._append_with_retry(f"loan-{app_id}", [compliance_trigger])
 

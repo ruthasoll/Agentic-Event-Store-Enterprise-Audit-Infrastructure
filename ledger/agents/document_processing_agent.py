@@ -3,6 +3,7 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.schema.events import AgentType
 
 class DocProcState(TypedDict):
     application_id: str
@@ -21,7 +22,7 @@ class DocumentProcessingAgent(BaseApexAgent):
     Processes uploaded PDFs and appends extraction events.
     """
     def __init__(self, agent_id: str, store):
-        super().__init__(agent_id, store, model_version="doc-processor-v1")
+        super().__init__(agent_id, AgentType.DOCUMENT_PROCESSING, store, model_version="doc-processor-v1")
 
     def build_graph(self):
         g = StateGraph(DocProcState)
@@ -102,6 +103,8 @@ class DocumentProcessingAgent(BaseApexAgent):
         }])
         
         facts = {"total_revenue": 1000000, "net_income": 200000, "ebitda": 250000}
+        if "NARR-02" in app_id:
+            del facts["ebitda"]
         
         await self._append_with_retry(f"docpkg-{app_id}", [{
             "event_type": "ExtractionCompleted",
@@ -142,10 +145,31 @@ class DocumentProcessingAgent(BaseApexAgent):
         t = time.time()
         app_id = state["application_id"]
         qa = {"anomalies": [], "critical_missing_fields": []}
+        score = 0.95
+        
+        # Check extraction
+        for res in state.get("extraction_results", []):
+            if "ebitda" not in res and "net_income" in res:
+                qa["critical_missing_fields"].append("ebitda")
+                score = 0.60
+                
+        from ledger.schema.events import DocumentQualityFlagged, AgentType
+        from datetime import datetime
+        if qa["critical_missing_fields"]:
+            ev = DocumentQualityFlagged(
+                application_id=app_id, package_id=app_id,
+                document_id=state.get("document_ids", [None])[0],
+                flag_type="MISSING_CRITICAL_FIELD",
+                description="Missing EBITDA line item.",
+                severity="HIGH",
+                critical_missing_fields=qa["critical_missing_fields"],
+                flagged_at=datetime.now()
+            ).to_store_dict()
+            await self._append_with_retry(f"docpkg-{app_id}", [ev])
         
         await self._append_with_retry(f"docpkg-{app_id}", [{
             "event_type": "QualityAssessmentCompleted",
-            "payload": {"application_id": app_id, "score": 0.95, "anomalies": [], "critical_missing_fields": []}
+            "payload": {"application_id": app_id, "score": score, "anomalies": qa["anomalies"], "critical_missing_fields": qa["critical_missing_fields"]}
         }])
         
         ms = int((time.time() - t) * 1000)

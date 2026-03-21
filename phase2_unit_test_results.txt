@@ -1,0 +1,20 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- C:\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.12.1, Faker-40.4.0, hydra-core-1.3.2, langsmith-0.6.0, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 3 items
+
+tests/phase2/test_agents.py::test_fraud_agent_logic PASSED               [ 33%]
+tests/phase2/test_agents.py::test_compliance_agent_rules PASSED          [ 66%]
+tests/phase2/test_agents.py::test_decision_orchestrator PASSED           [100%]
+
+============================== warnings summary ===============================
+tests/phase2/test_agents.py: 43 warnings
+  C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py:148: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 3 passed, 43 warnings in 1.21s ========================

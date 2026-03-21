@@ -31,29 +31,40 @@ pytest tests/test_schema_and_generator.py -v
 - Complete data generator (GAAP PDFs, Excel, CSV, 1,200+ seed events)
 - Event simulator (all 5 agent pipelines, deterministic)
 - Schema validator (validates all events against EVENT_REGISTRY)
-- Phase 0 tests: 10/10 passing
 
-## What You Implement
-| Component | File | Phase |
+## Phase 2: Agents, Projections & MCP
+We have completed Phase 2, which focuses on the agentic infrastructure and real-time views.
+
+| Component | File | Status |
 |-----------|------|-------|
-| EventStore | `ledger/event_store.py` | 1 |
-| ApplicantRegistryClient | `ledger/registry/client.py` | 1 |
-| Domain aggregates | `ledger/domain/aggregates/` | 2 |
-| DocumentProcessingAgent | `ledger/agents/base_agent.py` | 2 |
-| CreditAnalysisAgent | `ledger/agents/base_agent.py` | 2 (reference given) |
-| FraudDetectionAgent | `ledger/agents/base_agent.py` | 3 |
-| ComplianceAgent | `ledger/agents/base_agent.py` | 3 |
-| DecisionOrchestratorAgent | `ledger/agents/base_agent.py` | 3 |
-| Projections + daemon | `ledger/projections/` | 4 |
-| Upcasters | `ledger/upcasters.py` | 4 |
-| MCP server | `ledger/mcp_server.py` | 5 |
+| DocumentProcessingAgent | `ledger/agents/document_processing_agent.py` | [x] |
+| CreditAnalysisAgent | `ledger/agents/credit_analysis_agent.py` | [x] |
+| FraudDetectionAgent | `ledger/agents/fraud_detection_agent.py` | [x] |
+| ComplianceAgent | `ledger/agents/compliance_agent.py` | [x] |
+| DecisionOrchestratorAgent | `ledger/agents/decision_orchestrator_agent.py` | [x] |
+| ProjectionDaemon | `ledger/projections/daemon.py` | [x] |
+| MCP Server | `ledger/mcp/server.py` | [x] |
 
-## Gate Tests by Phase
+## Gate Tests
 ```bash
-pytest tests/test_schema_and_generator.py -v  # Phase 0: all must pass before Phase 1
-pytest tests/test_event_store.py -v           # Phase 1
-pytest tests/test_domain.py -v               # Phase 2
-pytest tests/test_narratives.py -v           # Phase 3: all 5 must pass
-pytest tests/test_projections.py -v          # Phase 4
-pytest tests/test_mcp.py -v                  # Phase 5
+# Phase 0 & 1: Schema & Event Store
+pytest tests/test_schema_and_generator.py -v
+pytest tests/test_event_store.py -v
+
+# Phase 2: Narrative Scenarios
+# These tests verify the full E2E flow across all 5 agents.
+pytest tests/test_narratives.py -v
+```
+
+### Running Narrative Tests
+The narrative tests cover real-world scenarios:
+- **NARR-01**: Concurrent OCC collision handling.
+- **NARR-02**: Document extraction failure (ebitda missing).
+- **NARR-03**: Agent crash & recovery (replay from event stream).
+
+Run them specifically with:
+```bash
+pytest tests/test_narratives.py -k test_narr01
+pytest tests/test_narratives.py -k test_narr02
+pytest tests/test_narratives.py -k test_narr03
 ```

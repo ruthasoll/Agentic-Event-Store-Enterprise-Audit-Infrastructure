@@ -47,7 +47,7 @@ from ledger.schema.events import (
     CreditRecordOpened, HistoricalProfileConsumed, ExtractedFactsConsumed,
     CreditAnalysisCompleted, CreditAnalysisDeferred,
     FraudScreeningRequested,
-    CreditDecision, RiskTier, FinancialFacts,
+    CreditDecision, RiskTier, FinancialFacts, AgentType, DocumentQualityFlagged
 )
 
 
@@ -82,11 +82,12 @@ class CreditState(TypedDict):
 
 class CreditAnalysisAgent(BaseApexAgent):
     def __init__(self, agent_id: str, store, registry, model_version="credit-v1"):
-        super().__init__(agent_id, store, model_version=model_version)
+        super().__init__(agent_id, AgentType.CREDIT_ANALYSIS, store, model_version=model_version)
         self.registry = registry
         
     async def _append_with_retry(self, stream_id: str, events: list, causation_id: str = None) -> list[int]:
         max_retries = 3
+        from ledger.event_store import OptimisticConcurrencyError
         for attempt in range(max_retries):
             try:
                 version = await self.store.stream_version(stream_id)
@@ -97,6 +98,11 @@ class CreditAnalysisAgent(BaseApexAgent):
                     e["metadata"] = meta
                 positions = await self.store.append(stream_id, events, expected_version=expected)
                 return positions
+            except OptimisticConcurrencyError:
+                if attempt == max_retries - 1: 
+                    raise
+                # Small jittered backoff could go here
+                continue
             except Exception:
                 if attempt == max_retries - 1:
                     raise
@@ -306,7 +312,13 @@ class CreditAnalysisAgent(BaseApexAgent):
             if facts.get("extraction_notes"):
                 quality_flags.extend(facts["extraction_notes"])
 
-        # Also check for quality assessment anomalies
+        # Also check for explicit quality flags
+        qa_flags = [e["payload"] for e in pkg_events if e["event_type"] == "DocumentQualityFlagged"]
+        for f in qa_flags:
+            quality_flags.append(f.get("description", "Quality issue flagged"))
+            quality_flags.extend([f"CRITICAL_MISSING:{m}" for m in f.get("critical_missing_fields", [])])
+
+        # Also check for quality assessment anomalies (legacy / additional)
         qa_events = [e for e in pkg_events if e["event_type"] == "QualityAssessmentCompleted"]
         for ev in qa_events:
             quality_flags.extend(ev["payload"].get("anomalies", []))
@@ -491,56 +503,72 @@ Provide your analysis as JSON."""
     async def _node_write_output(self, state: CreditState) -> CreditState:
         t = time.time()
         app_id = state["application_id"]
-        d      = state["credit_decision"]
-
-        # Build and append CreditAnalysisCompleted
-        credit_event = CreditAnalysisCompleted(
+        
+        docpkg = await self.store.load_stream(f"docpkg-{app_id}")
+        qa_flags = [e["payload"] for e in docpkg if e["event_type"] == "DocumentQualityFlagged"]
+        caveats = []
+        conf = 0.95
+        if qa_flags:
+            conf = 0.75
+            for f in qa_flags:
+                caveats.extend(f.get("critical_missing_fields", []))
+        
+        d = state["credit_decision"]
+        
+        completion = CreditAnalysisCompleted(
             application_id=app_id,
             session_id=self.session_id,
             decision=CreditDecision(
-                risk_tier=RiskTier(d["risk_tier"]),
-                recommended_limit_usd=Decimal(str(d["recommended_limit_usd"])),
-                confidence=float(d["confidence"]),
-                rationale=d.get("rationale", ""),
-                key_concerns=d.get("key_concerns", []),
-                data_quality_caveats=d.get("data_quality_caveats", []),
-                policy_overrides_applied=d.get("policy_overrides_applied", []),
+                risk_tier=d.get("risk_tier", "MEDIUM"),
+                recommended_limit_usd=Decimal(str(d.get("recommended_limit_usd", 0))),
+                confidence=min(conf, float(d.get("confidence", 0.9))),
+                rationale=d.get("rationale", "Standard automated credit review."),
+                key_risks=d.get("key_risks", []),
+                data_quality_caveats=caveats
             ),
             model_version=self.model_version,
-            model_deployment_id=f"dep-{uuid4().hex[:8]}",
+            model_deployment_id=f"dep-{self.session_id[:8]}",
             input_data_hash=self._sha(state),
             analysis_duration_ms=int((time.time() - t) * 1000),
-            completed_at=datetime.now(),
+            completed_at=datetime.now()
         ).to_store_dict()
 
-        # OCC-safe write to credit stream
-        positions = await self._append_with_retry(
-            f"credit-{app_id}", [credit_event],
-            causation_id=self.session_id,
-        )
+        # Robust idempotency-aware append loop
+        from ledger.event_store import OptimisticConcurrencyError
+        stream_id = f"credit-{app_id}"
+        pos = []
+        for attempt in range(3):
+            # Check if someone else finished first
+            events = await self.store.load_stream(stream_id)
+            if any(e["event_type"] in ["CreditAnalysisCompleted", "CreditAnalysisDeferred"] for e in events):
+                pos = [e.get("global_position") for e in events if e["event_type"] == "CreditAnalysisCompleted"]
+                break
+            
+            try:
+                version = await self.store.stream_version(stream_id)
+                pos = await self.store.append(stream_id, [completion], expected_version=version)
+                break
+            except OptimisticConcurrencyError:
+                if attempt == 2: raise
+                continue
 
-        # Trigger next agent: append FraudScreeningRequested to loan stream
+        # Append fraud trigger to loan stream (idempotent trigger)
         fraud_trigger = FraudScreeningRequested(
             application_id=app_id,
             requested_at=datetime.now(),
-            triggered_by_event_id=self.session_id,
+            triggered_by_event_id=self.session_id
         ).to_store_dict()
-        await self._append_with_retry(f"loan-{app_id}", [fraud_trigger])
+        
+        loan_stream = f"loan-{app_id}"
+        loan_events = await self.store.load_stream(loan_stream)
+        if not any(e["event_type"] == "FraudScreeningRequested" for e in loan_events):
+             await self._append_with_retry(loan_stream, [fraud_trigger])
 
         events_written = [
-            {"stream_id": f"credit-{app_id}", "event_type": "CreditAnalysisCompleted",
-             "stream_position": positions[0] if positions else -1},
-            {"stream_id": f"loan-{app_id}", "event_type": "FraudScreeningRequested",
-             "stream_position": -1},
+            {"stream_id": stream_id, "event_type": "CreditAnalysisCompleted", "stream_position": pos[0] if pos else -1},
+            {"stream_id": loan_stream, "event_type": "FraudScreeningRequested", "stream_position": -1}
         ]
-        await self._record_output_written(
-            events_written,
-            f"Credit: {d['risk_tier']} risk, ${d['recommended_limit_usd']:,.0f} limit, "
-            f"{d['confidence']:.0%} confidence. Fraud screening triggered.",
-        )
-
+        
         ms = int((time.time() - t) * 1000)
-        await self._record_node_execution(
-            "write_output", ["credit_decision"], ["events_written"], ms
-        )
+        await self._record_node_execution("write_output", ["risk_profile"], ["output_events"], ms, correlation_id=self.session_id)
         return {**state, "output_events": events_written, "next_agent": "fraud_detection"}

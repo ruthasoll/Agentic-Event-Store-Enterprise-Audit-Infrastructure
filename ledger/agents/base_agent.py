@@ -1,40 +1,67 @@
-from datetime import datetime
-from typing import Any, Dict, List
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 from ledger.event_store import EventStore, OptimisticConcurrencyError
+from ledger.schema.events import AgentSessionStarted, AgentSessionCompleted, AgentSessionFailed, AgentType
 
 class BaseApexAgent:
     """
     Base class for all Agents interacting with The Ledger.
     Enforces Gas Town patterns and strict event stream logging.
     """
-    def __init__(self, agent_id: str, store: EventStore, model_version: str):
+    def __init__(self, agent_id: str, agent_type: AgentType, store: EventStore, model_version: str):
         self.agent_id = agent_id
+        self.agent_type = agent_type
         self.store = store
         self.model_version = model_version
         self.session_id = str(uuid4())
+        self.application_id: Optional[str] = None
 
-    async def start_session(self, application_id: str, context_source: str, context_token_count: int, correlation_id: str):
-        """Gas Town: Precedes any action with AgentSessionStarted"""
-        event = {
-            "event_type": "AgentSessionStarted",
-            "payload": {
-                "session_id": self.session_id,
-                "agent_id": self.agent_id,
-                "application_id": application_id,
-                "model_version": self.model_version,
-                "context_source": context_source,
-                "context_token_count": context_token_count,
-            }
-        }
-        await self._append_to_agent_stream([event], correlation_id)
+    def _parse_json(self, text: str) -> dict:
+        """Robustly parse JSON from LLM output, handling markdown blocks."""
+        if not text: return {}
+        clean = text.strip()
+        if clean.startswith("```json"):
+            clean = clean[7:]
+        if clean.endswith("```"):
+            clean = clean[:-3]
+        return json.loads(clean.strip())
+
+    async def start_session(self, application_id: str, context: dict = None) -> str:
+        self.application_id = application_id
+        stream_id = f"agent-{self.agent_id}-{application_id}"
+        events = await self.store.load_stream(stream_id)
         
-    async def _append_to_agent_stream(self, events: List[Dict[str, Any]], correlation_id: str):
-        stream_id = f"agent-{self.agent_id}-{self.session_id}"
+        ctx_source = "new_invocation"
+        if events:
+            starts = [e for e in events if e["event_type"] == "AgentSessionStarted"]
+            ends = [e for e in events if e["event_type"] == "AgentSessionCompleted"]
+            if len(starts) > len(ends):
+                prior_id = starts[-1]["payload"]["session_id"]
+                ctx_source = f"prior_session_replay: {prior_id}"
+                
+        payload = {
+            "session_id": self.session_id,
+            "agent_type": self.agent_type,
+            "agent_id": self.agent_id,
+            "application_id": application_id,
+            "model_version": self.model_version,
+            "langgraph_graph_version": "1.0.0", # Simplified
+            "context_source": ctx_source,
+            "context_token_count": 0 # Simplified
+        }
+        if context: payload.update(context)
+        
+        ev = AgentSessionStarted(**payload, started_at=datetime.now(timezone.utc))
+        await self._append_to_agent_stream(application_id, [ev.to_store_dict()])
+        return self.session_id
+        
+    async def _append_to_agent_stream(self, application_id: str, events: List[Dict[str, Any]], correlation_id: str = None):
+        stream_id = f"agent-{self.agent_id}-{application_id}"
         
         # Agents write to their isolated stream. We use ExpectedVersion = -1 if new, but for simplicity agent streams usually don't have overlapping writes.
         # However, to be purely OCC safe, we should track version.
-        version = await self.store.stream_version(stream_id)
         
         for e in events:
             # We enforce structure here if not already done
@@ -64,7 +91,7 @@ class BaseApexAgent:
                 "duration_ms": duration_ms
             }
         }
-        await self._append_to_agent_stream([event], correlation_id or self.session_id)
+        await self._append_to_agent_stream(self.application_id, [event], correlation_id or self.session_id)
 
     async def _record_tool_call(self, tool_name: str, arguments: dict|str, result_summary: str, duration_ms: int, correlation_id: str = None):
         event = {
@@ -76,16 +103,43 @@ class BaseApexAgent:
                 "duration_ms": duration_ms
             }
         }
-        await self._append_to_agent_stream([event], correlation_id or self.session_id)
+        await self._append_to_agent_stream(self.application_id, [event], correlation_id or self.session_id)
         
-    async def complete_session(self, status: str, correlation_id: str, error_message: str = None):
+    async def complete_session(self, status: str, application_id: str, error_message: str = None):
         """Mark session as AgentSessionCompleted, AgentSessionFailed, or AgentSessionRecovered"""
-        event = {
-            "event_type": f"AgentSession{status}",
-            "payload": {
-                "session_id": self.session_id,
-                "completed_at": datetime.utcnow().isoformat(),
-                "error_message": error_message
-            }
-        }
-        await self._append_to_agent_stream([event], correlation_id)
+        if status == "Completed":
+            ev = AgentSessionCompleted(
+                session_id=self.session_id,
+                agent_type=self.agent_type,
+                agent_id=self.agent_id,
+                application_id=application_id,
+                total_nodes_executed=0,
+                total_llm_calls=0,
+                total_tokens_used=0,
+                total_cost_usd=0.0,
+                total_duration_ms=0,
+                completed_at=datetime.now(timezone.utc)
+            )
+        else:
+            ev = AgentSessionFailed(
+                session_id=self.session_id,
+                agent_type=self.agent_type,
+                application_id=application_id,
+                error_type="ExecutionError",
+                error_message=error_message or "Unknown error",
+                recoverable=True,
+                failed_at=datetime.now(timezone.utc)
+            )
+        await self._append_to_agent_stream(application_id, [ev.to_store_dict()])
+
+    async def process_application(self, application_id: str):
+        """Standard entry point for running an agent session."""
+        await self.start_session(application_id)
+        graph = self.build_graph()
+        initial = self._initial_state(application_id)
+        try:
+            await graph.ainvoke(initial)
+            await self.complete_session("Completed", application_id)
+        except Exception as e:
+            await self.complete_session("Failed", application_id, error_message=str(e))
+            raise

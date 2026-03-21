@@ -397,6 +397,17 @@ class PackageReadyForAnalysis(BaseEvent):
     quality_flag_count: int
     ready_at: datetime
 
+class DocumentQualityFlagged(BaseEvent):
+    event_type: str = "DocumentQualityFlagged"
+    application_id: str
+    package_id: str
+    document_id: str | None = None
+    flag_type: str
+    description: str
+    severity: str = "MEDIUM"
+    critical_missing_fields: list[str] = Field(default_factory=list)
+    flagged_at: datetime
+
 
 # ─── AGGREGATE 3: AGENT SESSION ──────────────────────────────────────────────
 # stream: "agent-{agent_type}-{session_id}"

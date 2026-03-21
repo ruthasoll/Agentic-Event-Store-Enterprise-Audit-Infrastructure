@@ -138,6 +138,34 @@ def register_tools(mcp: FastMCP, store):
             return format_error(e)
 
     @mcp.tool()
+    async def search_applications(
+        applicant_id: str = None,
+        status: str = None,
+        limit: int = 20
+    ) -> str:
+        """Search for loan applications by applicant ID or current state."""
+        try:
+            async with store._pool.acquire() as conn:
+                where = []
+                args = []
+                if applicant_id:
+                    where.append(f"applicant_id = ${len(args)+1}")
+                    args.append(applicant_id)
+                if status:
+                    where.append(f"state = ${len(args)+1}")
+                    args.append(status)
+                
+                query = "SELECT * FROM application_summary_view"
+                if where:
+                    query += " WHERE " + " AND ".join(where)
+                query += f" ORDER BY updated_at DESC LIMIT {limit}"
+                
+                rows = await conn.fetch(query, *args)
+                return json.dumps([dict(r) for r in rows], default=str)
+        except Exception as e:
+            return format_error(e)
+
+    @mcp.tool()
     async def generate_decision(
         correlation_id: str,
         application_id: str,

@@ -1,0 +1,17 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.12.1, Faker-40.4.0, hydra-core-1.3.2, langsmith-0.6.0, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 5 items
+
+tests\test_narratives.py ...ss                                           [100%]
+
+============================== warnings summary ===============================
+tests/test_narratives.py: 106 warnings
+  C:\Users\ruths\Desktop\TRP1\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py:148: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================= 3 passed, 2 skipped, 106 warnings in 2.26s ==================
