@@ -2,12 +2,18 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from enum import Enum
 from pydantic import BaseModel, Field
 from ledger.event_store import EventStore, OptimisticConcurrencyError
 from ledger.schema.events import (
     AgentSessionStarted, AgentSessionCompleted, AgentSessionFailed, 
     AgentSessionRecovered, AgentType, StoredEvent
 )
+
+class SessionHealth(str, Enum):
+    HEALTHY = "HEALTHY"
+    NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
+    FAILED = "FAILED"
 
 class AgentContext(BaseModel):
     """Structured memory for the Gas Town pattern."""
@@ -18,7 +24,9 @@ class AgentContext(BaseModel):
     last_event_position: int = -1
     nodes_executed: List[str] = Field(default_factory=list)
     tools_called: List[Dict[str, Any]] = Field(default_factory=list)
+    context_text: str = "" # Summarized history for the LLM
     pending_work: Dict[str, Any] = Field(default_factory=dict)
+    session_health: SessionHealth = SessionHealth.HEALTHY
     is_recovered: bool = False
 
 class BaseApexAgent:
@@ -79,14 +87,21 @@ class BaseApexAgent:
             application_id=application_id,
             agent_type=self.agent_type,
             last_event_position=events[-1].stream_position,
-            is_recovered=not is_completed
+            is_recovered=not is_completed,
+            session_health=SessionHealth.HEALTHY if is_completed else SessionHealth.NEEDS_RECONCILIATION
         )
         
+        history_lines = []
         for e in session_events:
             if e.event_type == "AgentNodeExecuted":
-                ctx.nodes_executed.append(e.payload["node_name"])
+                node_name = e.payload["node_name"]
+                ctx.nodes_executed.append(node_name)
+                history_lines.append(f"- Executed node: {node_name}")
             elif e.event_type == "AgentToolCalled":
                 ctx.tools_called.append(e.payload)
+                history_lines.append(f"- Called tool: {e.payload.get('tool_name')} with result: {e.payload.get('result_summary')}")
+        
+        ctx.context_text = "\n".join(history_lines)
                 
         # Detect Partial Decision:
         # If the last node was the decision node but no completion, it's pending output.
@@ -94,6 +109,7 @@ class BaseApexAgent:
             last_node = ctx.nodes_executed[-1]
             if "decision" in last_node.lower() or "orchestrate" in last_node.lower():
                 ctx.pending_work["partial_decision_detected"] = True
+                ctx.session_health = SessionHealth.NEEDS_RECONCILIATION
                 
         return ctx
 

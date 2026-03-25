@@ -43,10 +43,8 @@ from uuid import uuid4
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 from ledger.schema.events import (
-    CreditRecordOpened, HistoricalProfileConsumed, ExtractedFactsConsumed,
-    CreditAnalysisCompleted, CreditAnalysisDeferred,
-    FraudScreeningRequested,
     CreditDecision, RiskTier, FinancialFacts, AgentType, DocumentQualityFlagged
 )
 
@@ -504,71 +502,39 @@ Provide your analysis as JSON."""
         t = time.time()
         app_id = state["application_id"]
         
-        docpkg = await self.store.load_stream(f"docpkg-{app_id}")
-        qa_flags = [e["payload"] for e in docpkg if e["event_type"] == "DocumentQualityFlagged"]
-        caveats = []
-        conf = 0.95
-        if qa_flags:
-            conf = 0.75
-            for f in qa_flags:
-                caveats.extend(f.get("critical_missing_fields", []))
-        
+        # Mastery: Use domain aggregate to enforce business rules
+        agg = await LoanApplicationAggregate.load(self.store, app_id)
         d = state["credit_decision"]
         
-        completion = CreditAnalysisCompleted(
-            application_id=app_id,
-            session_id=self.session_id,
-            decision=CreditDecision(
-                risk_tier=d.get("risk_tier", "MEDIUM"),
-                recommended_limit_usd=Decimal(str(d.get("recommended_limit_usd", 0))),
-                confidence=min(conf, float(d.get("confidence", 0.9))),
-                rationale=d.get("rationale", "Standard automated credit review."),
-                key_risks=d.get("key_risks", []),
-                data_quality_caveats=caveats
-            ),
-            model_version=self.model_version,
-            model_deployment_id=f"dep-{self.session_id[:8]}",
-            input_data_hash=self._sha(state),
-            analysis_duration_ms=int((time.time() - t) * 1000),
-            completed_at=datetime.now()
-        ).to_store_dict()
-
-        # Robust idempotency-aware append loop
-        from ledger.event_store import OptimisticConcurrencyError
-        stream_id = f"credit-{app_id}"
-        pos = []
-        for attempt in range(3):
-            # Check if someone else finished first
-            events = await self.store.load_stream(stream_id)
-            if any(e["event_type"] in ["CreditAnalysisCompleted", "CreditAnalysisDeferred"] for e in events):
-                pos = [e.get("global_position") for e in events if e["event_type"] == "CreditAnalysisCompleted"]
-                break
-            
-            try:
-                version = await self.store.stream_version(stream_id)
-                pos = await self.store.append(stream_id, [completion], expected_version=version)
-                break
-            except OptimisticConcurrencyError:
-                if attempt == 2: raise
-                continue
-
-        # Append fraud trigger to loan stream (idempotent trigger)
-        fraud_trigger = FraudScreeningRequested(
-            application_id=app_id,
-            requested_at=datetime.now(),
-            triggered_by_event_id=self.session_id
-        ).to_store_dict()
+        decision_data = {
+            "risk_tier": d.get("risk_tier", "MEDIUM"),
+            "recommended_limit_usd": float(d.get("recommended_limit_usd", 0)),
+            "confidence": float(d.get("confidence", 0.9)),
+            "rationale": d.get("rationale", "Standard automated credit review."),
+            "key_risks": d.get("key_risks", []),
+            "data_quality_caveats": state.get("quality_flags", [])
+        }
         
-        loan_stream = f"loan-{app_id}"
-        loan_events = await self.store.load_stream(loan_stream)
-        if not any(e["event_type"] == "FraudScreeningRequested" for e in loan_events):
-             await self._append_with_retry(loan_stream, [fraud_trigger])
+        try:
+            from ledger.schema.events import CreditAnalysisCompleted
+            completion_event = agg.complete_analysis(decision_data=decision_data)
+            await self._append_with_retry(f"credit-{app_id}", [completion_event.model_dump(mode='json')])
+        except Exception as e:
+            raise ValueError(f"Domain rule violation: {e}")
 
-        events_written = [
-            {"stream_id": stream_id, "event_type": "CreditAnalysisCompleted", "stream_position": pos[0] if pos else -1},
-            {"stream_id": loan_stream, "event_type": "FraudScreeningRequested", "stream_position": -1}
-        ]
-        
+        # Trigger Fraud (idempotent)
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        if not any(e.event_type == "FraudScreeningRequested" for e in loan_events):
+             from ledger.schema.events import FraudScreeningRequested
+             fraud_trigger = FraudScreeningRequested(
+                 application_id=app_id,
+                 requested_at=datetime.now(),
+                 triggered_by_event_id=self.session_id
+             )
+             await self._append_with_retry(f"loan-{app_id}", [fraud_trigger.model_dump(mode='json')])
+
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution("write_output", ["risk_profile"], ["output_events"], ms, correlation_id=self.session_id)
-        return {**state, "output_events": events_written, "next_agent": "fraud_detection"}
+        return {**state, "next_agent": "fraud_detection"}
+        
+

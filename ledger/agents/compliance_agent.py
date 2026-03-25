@@ -14,10 +14,10 @@ from uuid import uuid4
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
+from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 from ledger.schema.events import (
-    ComplianceCheckInitiated, ComplianceRulePassed, ComplianceRuleFailed,
-    ComplianceRuleNoted, ComplianceCheckCompleted,
-    DecisionRequested, ApplicationDeclined, AgentType, ComplianceVerdict
+    ApplicationDeclined, DecisionRequested, AgentType, ComplianceVerdict
 )
 
 class ComplianceState(TypedDict):
@@ -169,15 +169,17 @@ class ComplianceAgent(BaseApexAgent):
         t = time.time()
         app_id = state["application_id"]
         
-        # Initiate Compliance Screening
-        event = ComplianceCheckInitiated(
-            application_id=app_id,
-            session_id=self.session_id,
-            regulation_set_version="1.0.0",
-            rules_to_evaluate=["BSA_KNOW_YOUR_CUSTOMER", "OFAC_SANCTIONS", "AML_MONITORING", "CREDIT_HISTORY_CHECK", "IDENTITY_VERIFICATION", "FRAUD_REGISTRY_CHECK"],
-            initiated_at=datetime.now(),
-        ).to_store_dict()
-        await self._append_with_retry(f"compliance-{app_id}", [event])
+        # Load or create aggregate
+        agg = await ComplianceRecordAggregate.load(self.store, app_id)
+        
+        # Initiate Compliance Screening via Aggregate Command
+        event = agg.initiate(
+            rules=["BSA", "OFAC", "JURISDICTION", "ENTITY", "HISTORY", "CRA"],
+            regulation_version="1.0.0",
+            session_id=self.session_id
+        )
+        
+        await self._append_with_retry(f"compliance-{app_id}", [event.model_dump(mode='json')])
 
         ms = int((time.time() - t) * 1000)
         await self._record_node_execution("validate_inputs", ["application_id"], ["compliance_check_initiated"], ms, correlation_id=self.session_id)
@@ -214,40 +216,28 @@ class ComplianceAgent(BaseApexAgent):
         evidence_hash = self._sha(f"{rule_id}-{co.get('company_id')}-{passes}")
 
         results = state.get("rule_results", []) or []
-        event = None
-
+        # Load aggregate to get latest version and enforcement
+        agg = await ComplianceRecordAggregate.load(self.store, app_id)
+        
         if rule_id == "REG-006":
-            event = ComplianceRuleNoted(
+            from ledger.schema.events import ComplianceRuleNoted
+            event_obj = ComplianceRuleNoted(
                 application_id=app_id, session_id=self.session_id,
                 rule_id=rule_id, rule_name=reg["name"], note_type=reg["note_type"], note_text=reg["note_text"],
                 evaluated_at=datetime.now()
             )
             results.append({"rule_id": rule_id, "status": "NOTED"})
         elif passes:
-            event = ComplianceRulePassed(
-                application_id=app_id, session_id=self.session_id,
-                rule_id=rule_id, rule_name=reg["name"], rule_version=reg["version"],
-                evidence_hash=evidence_hash, evaluation_notes="Rule criteria met.",
-                evaluated_at=datetime.now()
-            )
+            event_obj = agg.pass_rule(rule_id, reg["name"], self.session_id, evidence_hash)
             results.append({"rule_id": rule_id, "status": "PASSED"})
         else:
-            event = ComplianceRuleFailed(
-                application_id=app_id, session_id=self.session_id,
-                rule_id=rule_id, rule_name=reg["name"], rule_version=reg["version"],
-                failure_reason=reg["failure_reason"],
-                is_hard_block=reg.get("is_hard_block", False),
-                remediation_available=bool(reg.get("remediation")),
-                remediation_description=reg.get("remediation"),
-                evidence_hash=evidence_hash, evaluated_at=datetime.now()
-            )
+            event_obj = agg.fail_rule(rule_id, reg["name"], self.session_id, reg["failure_reason"], evidence_hash)
             results.append({"rule_id": rule_id, "status": "FAILED"})
             if reg.get("is_hard_block"):
                 state["has_hard_block"] = True
                 state["block_rule_id"] = rule_id
 
-        if event:
-            await self._append_with_retry(f"compliance-{app_id}", [event.to_store_dict()])
+        await self._append_with_retry(f"compliance-{app_id}", [event_obj.model_dump(mode='json')])
 
         ms = int((time.time() - t) * 1000)
         node_name = f"evaluate_{rule_id.lower().replace('-', '_')}"
@@ -258,48 +248,29 @@ class ComplianceAgent(BaseApexAgent):
     async def _node_write_output(self, state: ComplianceState) -> ComplianceState:
         t = time.time()
         app_id = state["application_id"]
-        has_block = state.get("has_hard_block", False)
+        # Use aggregates for final output
+        comp_agg = await ComplianceRecordAggregate.load(self.store, app_id)
+        loan_agg = await LoanApplicationAggregate.load(self.store, app_id)
         
-        results = state.get("rule_results", [])
-        rules_passed = len([r for r in results if r["status"] == "PASSED"])
-        rules_failed = len([r for r in results if r["status"] == "FAILED"])
-        rules_noted  = len([r for r in results if r["status"] == "NOTED"])
-
-        completed_event = ComplianceCheckCompleted(
-            application_id=app_id,
-            session_id=self.session_id,
-            rules_evaluated=len(results),
-            rules_passed=rules_passed,
-            rules_failed=rules_failed,
-            rules_noted=rules_noted,
-            has_hard_block=has_block,
-            overall_verdict=ComplianceVerdict.BLOCKED if has_block else ComplianceVerdict.CLEAR,
-            completed_at=datetime.now()
-        ).to_store_dict()
-        positions = await self._append_with_retry(f"compliance-{app_id}", [completed_event])
-
+        completed_event = comp_agg.complete(self.session_id)
+        positions = await self._append_with_retry(f"compliance-{app_id}", [completed_event.model_dump(mode='json')])
         output_events = [{"stream_id": f"compliance-{app_id}", "event_type": "ComplianceCheckCompleted", "stream_position": positions[0] if positions else -1}]
 
         if has_block:
-            ev = ApplicationDeclined(
-                application_id=app_id,
-                decline_reasons=[REGULATIONS.get(state.get("block_rule_id"), {}).get("failure_reason", "Compliance block")],
-                declined_by=self.session_id,
-                adverse_action_notice_required=True,
-                adverse_action_codes=[state.get("block_rule_id", "REG-UNKNOWN")],
-                declined_at=datetime.now()
-            ).to_store_dict()
-            await self._append_with_retry(f"loan-{app_id}", [ev])
+            reason = REGULATIONS.get(state.get("block_rule_id"), {}).get("failure_reason", "Compliance block")
+            declined_event = loan_agg.decline(reasons=[reason], declined_by=self.session_id)
+            await self._append_with_retry(f"loan-{app_id}", [declined_event.model_dump(mode='json')])
             output_events.append({"stream_id": f"loan-{app_id}", "event_type": "ApplicationDeclined", "stream_position": -1})
-            next_agent = None
+            next_agent = END
         else:
+            from ledger.schema.events import DecisionRequested
             decision_event = DecisionRequested(
                 application_id=app_id,
                 requested_at=datetime.now(),
                 all_analyses_complete=True,
                 triggered_by_event_id=self.session_id
-            ).to_store_dict()
-            await self._append_with_retry(f"loan-{app_id}", [decision_event])
+            )
+            await self._append_with_retry(f"loan-{app_id}", [decision_event.model_dump(mode='json')])
             output_events.append({"stream_id": f"loan-{app_id}", "event_type": "DecisionRequested", "stream_position": -1})
             next_agent = "decision_orchestrator"
             

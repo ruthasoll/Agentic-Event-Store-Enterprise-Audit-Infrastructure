@@ -443,7 +443,7 @@ class InMemoryEventStore:
         # stream_id -> list of event dicts
         self._streams: dict[str, list[dict]] = _defaultdict(list)
         # stream_id -> current version (position of last event, -1 if empty)
-        self._versions: dict[str, int] = {}
+        self._versions: dict[str, int] = _defaultdict(lambda: -1)
         self.upcasters = upcaster_registry
         # global append log (ordered by insertion)
         self._global: list[dict] = []
@@ -455,7 +455,7 @@ class InMemoryEventStore:
         self._archived: dict[str, _datetime] = {}
 
     async def stream_version(self, stream_id: str) -> int:
-        return self._versions.get(stream_id, 0)
+        return self._versions[stream_id]
 
     async def append(
         self,
@@ -466,7 +466,7 @@ class InMemoryEventStore:
         metadata: dict | None = None,
     ) -> list[int]:
         async with self._locks[stream_id]:
-            current = self._versions.get(stream_id, 0)
+            current = self._versions[stream_id]
             if current != expected_version:
                 raise OptimisticConcurrencyError(stream_id, expected_version, current)
 
@@ -479,7 +479,7 @@ class InMemoryEventStore:
                 meta["causation_id"] = causation_id
 
             for i, event in enumerate(events):
-                pos = current + 1 + i
+                pos = expected_version + 1 + i
                 payload = dict(event.get("payload", {}))
                 event_type = event["event_type"]
                 event_version = event.get("event_version", 1)

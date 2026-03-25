@@ -105,36 +105,71 @@ async def get_compliance_summary(application_id: str) -> Dict[str, Any]:
     """
     Retrieves the compliance status for a loan application.
     Aggregates events from the compliance record stream.
+    
+    Preconditions:
+    - application_id must have a 'compliance-{application_id}' stream.
     """
-    store = await get_store()
-    stream_id = f"compliance-{application_id}"
-    events = await store.load_stream(stream_id)
+    try:
+        store = await get_store()
+        stream_id = f"compliance-{application_id}"
+        events = await store.load_stream(stream_id)
+        if not events:
+            return format_error(ValueError(f"No compliance stream found for {application_id}"), 
+                                "Ensure compliance checks have been initiated for this application.")
+        
+        passed = []
+        failed = []
+        verdict = "UNKNOWN"
+        
+        for e in events:
+            ptype = e.event_type
+            payload = e.payload
+            if ptype == "ComplianceRulePassed":
+                passed.append(payload.get("rule_name") or payload.get("rule_id"))
+            elif ptype == "ComplianceRuleFailed":
+                failed.append({
+                    "rule": payload.get("rule_name") or payload.get("rule_id"),
+                    "reason": payload.get("failure_reason")
+                })
+            elif ptype == "ComplianceCheckCompleted":
+                verdict = payload.get("overall_verdict")
+                
+        return {
+            "application_id": application_id,
+            "verdict": verdict,
+            "rules_passed_count": len(passed),
+            "rules_failed_count": len(failed),
+            "failing_rules": failed,
+            "passed_rules": passed
+        }
+    except Exception as e:
+        return format_error(e, "Check application_id and stream existence.")
+
+@mcp.tool()
+async def get_global_log(limit: int = 50, offset: int = 0) -> List[Dict[str, Any]] | Dict[str, Any]:
+    """
+    Retrieves the global event log across all streams, ordered by global_position.
+    Useful for system-wide auditing and timeline reconstruction.
     
-    passed = []
-    failed = []
-    verdict = "UNKNOWN"
-    
-    for e in events:
-        ptype = e.event_type
-        payload = e.payload
-        if ptype == "ComplianceRulePassed":
-            passed.append(payload.get("rule_name") or payload.get("rule_id"))
-        elif ptype == "ComplianceRuleFailed":
-            failed.append({
-                "rule": payload.get("rule_name") or payload.get("rule_id"),
-                "reason": payload.get("failure_reason")
-            })
-        elif ptype == "ComplianceCheckCompleted":
-            verdict = payload.get("overall_verdict")
-            
-    return {
-        "application_id": application_id,
-        "verdict": verdict,
-        "rules_passed_count": len(passed),
-        "rules_failed_count": len(failed),
-        "failing_rules": failed,
-        "passed_rules": passed
-    }
+    Preconditions:
+    - limit must be between 1 and 500.
+    """
+    try:
+        if not (1 <= limit <= 500):
+            return format_error(ValueError("Limit must be between 1 and 500"), "Adjust the limit parameter.")
+        
+        store = await get_store()
+        # load_all is an async generator
+        count = 0
+        results = []
+        async for event in store.load_all(from_position=offset):
+            results.append(event.model_dump(mode='json'))
+            count += 1
+            if count >= limit:
+                break
+        return results
+    except Exception as e:
+        return format_error(e, "Check database status and connection pool.")
 
 if __name__ == "__main__":
     mcp.run()

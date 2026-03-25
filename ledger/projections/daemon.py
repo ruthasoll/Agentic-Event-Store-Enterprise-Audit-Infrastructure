@@ -11,6 +11,9 @@ class Projector(Protocol):
         ...
     async def handle_event(self, event: dict, conn) -> None:
         ...
+    async def clear_state(self, conn) -> None:
+        """Wipe the projection table for a fresh rebuild."""
+        ...
 
 class ProjectionDaemon:
     def __init__(self, store, db_pool, projectors: List[Projector], batch_size: int = 500, poll_interval: float = 1.0):
@@ -20,6 +23,7 @@ class ProjectionDaemon:
         self.batch_size = batch_size
         self.poll_interval = poll_interval
         self._task: asyncio.Task | None = None
+        self._rebuild_tasks: Dict[str, asyncio.Task] = {}
         self._running = False
 
     async def start(self):
@@ -87,15 +91,38 @@ class ProjectionDaemon:
                     await self._save_checkpoint(conn, projector.name, last_pos)
                     logger.debug(f"Projector {projector.name} advanced to {last_pos}")
 
-    async def rebuild(self, projector_name: str):
-        """Wipes a projection and rebuilds from global position 0."""
-        projector = next((p for p in self.projectors if p.name == projector_name), None)
-        if not projector:
-            raise ValueError(f"Unknown projector: {projector_name}")
+    async def async_rebuild(self, projector_name: str):
+        """
+        Starts a background rebuild of a projector from position 0.
+        Does not block the main loop's processing of other projectors.
+        """
+        if projector_name in self._rebuild_tasks and not self._rebuild_tasks[projector_name].done():
+            logger.warning(f"Rebuild already in progress for {projector_name}")
+            return
             
-        logger.info(f"Rebuilding projector: {projector_name}")
-        async with self.db_pool.acquire() as conn:
-            await conn.execute("UPDATE projection_checkpoints SET last_position = 0 WHERE projection_name = $1", projector_name)
+        task = asyncio.create_task(self._perform_rebuild(projector_name))
+        self._rebuild_tasks[projector_name] = task
+        logger.info(f"Started background rebuild task for {projector_name}")
+
+    async def _perform_rebuild(self, projector_name: str):
+        try:
+            projector = next((p for p in self.projectors if p.name == projector_name), None)
+            if not projector: raise ValueError(f"Unknown projector: {projector_name}")
+            
+            async with self.db_pool.acquire() as conn:
+                # 1. Clear current state (Mastery: Implement shadow tables if true zero-downtime needed)
+                if hasattr(projector, "clear_state"):
+                    await projector.clear_state(conn)
+                
+                # 2. Reset checkpoint
+                await self._save_checkpoint(conn, projector_name, 0)
+                
+            # 3. The main loop will now pick it up from 0 in the next cycle.
+            # Alternatively, we can force-process it here in a separate loop if we want it to be faster.
+            logger.info(f"Rebuild initialized for {projector_name}. Main loop will re-process from 0.")
+            
+        except Exception as e:
+            logger.error(f"Rebuild task failed for {projector_name}: {e}", exc_info=True)
 
     async def _get_checkpoint(self, conn, name: str) -> int:
         row = await conn.fetchrow(
