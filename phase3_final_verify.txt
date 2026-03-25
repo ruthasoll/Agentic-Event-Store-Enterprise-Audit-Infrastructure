@@ -1,0 +1,12 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_phase3.py::test_projection_daemon_flow PASSED                 [100%]
+
+============================= 1 passed in 35.39s ==============================

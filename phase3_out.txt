@@ -1,0 +1,428 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_phase3.py::test_projection_daemon_flow FAILED                 [100%]
+
+================================== FAILURES ===================================
+_________________________ test_projection_daemon_flow _________________________
+
+store = <ledger.event_store.EventStore object at 0x0000025CAD4D9400>
+db_pool = <asyncpg.pool.Pool object at 0x0000025CAD30E740>
+
+    @pytest.mark.asyncio
+    async def test_projection_daemon_flow(store, db_pool):
+        # 1. Setup projectors
+        app_projector = ApplicationSummaryProjector()
+        agent_projector = AgentPerformanceLedgerProjector()
+        compliance_projector = ComplianceAuditView(store)
+    
+        projectors = [app_projector, agent_projector, compliance_projector]
+    
+        # 2. Clear old data for a clean test
+        async with db_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS application_summary_view")
+            await conn.execute("DROP TABLE IF EXISTS agent_performance_view")
+            await conn.execute("DROP TABLE IF EXISTS compliance_audit_snapshots")
+            await conn.execute("DELETE FROM projection_checkpoints")
+            await conn.execute("DELETE FROM events")
+            await conn.execute("DELETE FROM event_streams")
+    
+        # 3. Start Daemon
+        daemon = ProjectionDaemon(store, db_pool, projectors, batch_size=10, poll_interval=0.1)
+        await daemon.start()
+    
+        try:
+            # 4. Append events
+            app_id = "TEST-APP-001"
+            await store.append(f"loan-{app_id}", [
+                {"event_type": "ApplicationSubmitted", "payload": {"application_id": app_id, "applicant_id": "C-1", "requested_amount_usd": 50000}},
+                {"event_type": "DocumentUploadRequested", "payload": {"application_id": app_id}}
+            ], expected_version=-1)
+    
+            await store.append(f"agent-doc-1", [
+                {"event_type": "AgentSessionStarted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "application_id": app_id}},
+                {"event_type": "AgentSessionCompleted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "total_nodes_executed": 5, "total_tokens_used": 1000, "total_cost_usd": 0.01, "total_duration_ms": 500}}
+            ], expected_version=-1)
+    
+            await store.append(f"compliance-{app_id}", [
+                {"event_type": "ComplianceCheckRequested", "payload": {"application_id": app_id, "rules_to_evaluate": ["RULE-1", "RULE-2"]}},
+                {"event_type": "ComplianceRulePassed", "payload": {"application_id": app_id, "rule_id": "RULE-1"}}
+            ], expected_version=-1)
+    
+            # 5. Wait for daemon to process
+            wait_loops = 0
+            while wait_loops < 20:
+                lags = await daemon.get_lag()
+                if all(lag == 0 for lag in lags.values()):
+                    break
+                await asyncio.sleep(0.2)
+                wait_loops += 1
+    
+            lags = await daemon.get_lag()
+>           assert all(lag == 0 for lag in lags.values()), f"Projections still lagging: {lags}"
+E           AssertionError: Projections still lagging: {'application_summary': 762, 'agent_performance': 762, 'compliance_audit': 762}
+E           assert False
+E            +  where False = all(<generator object test_projection_daemon_flow.<locals>.<genexpr> at 0x0000025CAD4D5FF0>)
+
+tests\test_phase3.py:79: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 69, in _process_projector
+    async for event in self.store.load_all(from_position=checkpoint, batch_size=self.batch_size):
+    ...<8 lines>...
+            break
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py", line 218, in load_all
+    yield StoredEvent(**e)
+          ~~~~~~~~~~~^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\pydantic\main.py", line 250, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for StoredEvent
+event_id
+  Field required [type=missing, input_value={'global_position': 675, ...=datetime.timezone.utc)}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/missing
+============================== warnings summary ===============================
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+  C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py:152: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_phase3.py::test_projection_daemon_flow - AssertionError: Pr...
+======================= 1 failed, 6 warnings in 40.84s ========================

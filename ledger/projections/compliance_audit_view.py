@@ -48,8 +48,9 @@ class ComplianceAuditView:
         events = await self.store.load_stream(f"compliance-{application_id}", from_position=from_position, to_position=to_position)
         
         for e in events:
-            et = e["event_type"]
-            p = e["payload"]
+            # Handle both dict and StoredEvent object
+            et = e.event_type if hasattr(e, "event_type") else e["event_type"]
+            p = e.payload if hasattr(e, "payload") else e["payload"]
             
             if et in ["ComplianceCheckInitiated", "ComplianceCheckRequested"]:
                 rules = p.get("rules_to_evaluate", [])
@@ -86,25 +87,24 @@ class ComplianceAuditView:
             start_pos = row["stream_position"] + 1
             state = json.loads(row["state_json"])
             
-        # load forward from snapshot until we hit the timestamp
-        # In a real system we'd filter by timestamp in SQL, but for the event store API we load and filter in python
-        # Or add a load_events_until(stream_id, timestamp) in EventStore
-        
         events = await self.store.load_stream(f"compliance-{application_id}", from_position=start_pos)
         
         target_events = []
         for e in events:
-            if e["recorded_at"].replace(tzinfo=None) <= target_timestamp.replace(tzinfo=None):
+            rec_at = e.recorded_at if hasattr(e, "recorded_at") else e["recorded_at"]
+            if isinstance(rec_at, str):
+                rec_at = datetime.fromisoformat(rec_at.replace("Z", "+00:00"))
+            
+            if rec_at.replace(tzinfo=None) <= target_timestamp.replace(tzinfo=None):
                 target_events.append(e)
             else:
                 break
                 
-        # To avoid duplicate stream loading logic, we abstract the rebuild block if needed, but we can do it inline:
-        # Instead of calling `_rebuild_state` modifying `base_state`, we apply events manually.
         final_state = state or {"passed": [], "failed": [], "mandatory": []}
         for e in target_events:
-            et = e["event_type"]
-            p = e["payload"]
+            et = e.event_type if hasattr(e, "event_type") else e["event_type"]
+            p = e.payload if hasattr(e, "payload") else e["payload"]
+            
             if et in ["ComplianceCheckInitiated", "ComplianceCheckRequested"]:
                 rules = p.get("rules_to_evaluate", [])
                 for r in rules:
@@ -120,3 +120,4 @@ class ComplianceAuditView:
                 if rule in final_state["passed"]: final_state["passed"].remove(rule)
 
         return final_state
+

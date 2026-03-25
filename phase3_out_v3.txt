@@ -1,0 +1,266 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_phase3.py::test_projection_daemon_flow FAILED                 [100%]
+
+================================== FAILURES ===================================
+_________________________ test_projection_daemon_flow _________________________
+
+store = <ledger.event_store.EventStore object at 0x0000018E7DAA96A0>
+db_pool = <asyncpg.pool.Pool object at 0x0000018E7D8DE800>
+
+    @pytest.mark.asyncio
+    async def test_projection_daemon_flow(store, db_pool):
+        # 1. Setup projectors
+        app_projector = ApplicationSummaryProjector()
+        agent_projector = AgentPerformanceLedgerProjector()
+        compliance_projector = ComplianceAuditView(store)
+    
+        projectors = [app_projector, agent_projector, compliance_projector]
+    
+        # 2. Clear old data for a clean test
+        async with db_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS application_summary_view")
+            await conn.execute("DROP TABLE IF EXISTS agent_performance_view")
+            await conn.execute("DROP TABLE IF EXISTS compliance_audit_snapshots")
+            await conn.execute("DELETE FROM projection_checkpoints")
+            await conn.execute("DELETE FROM outbox")
+            await conn.execute("DELETE FROM events")
+            await conn.execute("DELETE FROM event_streams")
+    
+        # 3. Start Daemon
+        daemon = ProjectionDaemon(store, db_pool, projectors, batch_size=10, poll_interval=0.1)
+        await daemon.start()
+    
+        try:
+            # 4. Append events
+            app_id = "TEST-APP-001"
+            await store.append(f"loan-{app_id}", [
+                {"event_type": "ApplicationSubmitted", "payload": {"application_id": app_id, "applicant_id": "C-1", "requested_amount_usd": 50000}},
+                {"event_type": "DocumentUploadRequested", "payload": {"application_id": app_id}}
+            ], expected_version=-1)
+    
+            await store.append(f"agent-doc-1", [
+                {"event_type": "AgentSessionStarted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "application_id": app_id}},
+                {"event_type": "AgentSessionCompleted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "total_nodes_executed": 5, "total_tokens_used": 1000, "total_cost_usd": 0.01, "total_duration_ms": 500}}
+            ], expected_version=-1)
+    
+            await store.append(f"compliance-{app_id}", [
+                {"event_type": "ComplianceCheckRequested", "payload": {"application_id": app_id, "rules_to_evaluate": ["RULE-1", "RULE-2"]}},
+                {"event_type": "ComplianceRulePassed", "payload": {"application_id": app_id, "rule_id": "RULE-1"}}
+            ], expected_version=-1)
+    
+            # 5. Wait for daemon to process
+            wait_loops = 0
+            while wait_loops < 20:
+                lags = await daemon.get_lag()
+                if all(lag == 0 for lag in lags.values()):
+                    break
+                await asyncio.sleep(0.2)
+                wait_loops += 1
+    
+            lags = await daemon.get_lag()
+>           assert all(lag == 0 for lag in lags.values()), f"Projections still lagging: {lags}"
+E           AssertionError: Projections still lagging: {'application_summary': 63, 'agent_performance': 59, 'compliance_audit': 69}
+E           assert False
+E            +  where False = all(<generator object test_projection_daemon_flow.<locals>.<genexpr> at 0x0000018E7DAA5970>)
+
+tests\test_phase3.py:80: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: 'StoredEvent' object is not subscriptable
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 74, in _process_projector
+    await projector.handle_event(event_dict, conn)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\compliance_audit_view.py", line 37, in handle_event
+    state = await self._rebuild_state(app_id, to_position=pos)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\compliance_audit_view.py", line 51, in _rebuild_state
+    et = e["event_type"]
+         ~^^^^^^^^^^^^^^
+TypeError: 'StoredEvent' object is not subscriptable
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+Traceback (most recent call last):
+  File "asyncpg/protocol/prepared_stmt.pyx", line 175, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+  File "asyncpg/protocol/codecs/base.pyx", line 251, in asyncpg.protocol.protocol.Codec.encode
+  File "asyncpg/protocol/codecs/base.pyx", line 153, in asyncpg.protocol.protocol.Codec.encode_scalar
+  File "asyncpg/pgproto/codecs/datetime.pyx", line 208, in asyncpg.pgproto.pgproto.timestamptz_encode
+TypeError: expected a datetime.date or datetime.datetime instance, got 'str'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 74, in _process_projector
+    await projector.handle_event(event_dict, conn)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\application_summary.py", line 101, in handle_event
+    await conn.execute("UPDATE application_summary_view SET state = $2, final_decision_at = $3 WHERE application_id = $1", app_id, state, dt_str)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 357, in execute
+    _, status, _ = await self._execute(
+                   ^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1873, in _execute
+    result, _ = await self.__execute(
+                ^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1970, in __execute
+    result, stmt = await self._do_execute(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 2033, in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "asyncpg/protocol/protocol.pyx", line 184, in bind_execute
+  File "asyncpg/protocol/prepared_stmt.pyx", line 204, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+asyncpg.exceptions.DataError: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+Traceback (most recent call last):
+  File "asyncpg/protocol/prepared_stmt.pyx", line 175, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+  File "asyncpg/protocol/codecs/base.pyx", line 251, in asyncpg.protocol.protocol.Codec.encode
+  File "asyncpg/protocol/codecs/base.pyx", line 153, in asyncpg.protocol.protocol.Codec.encode_scalar
+  File "asyncpg/pgproto/codecs/datetime.pyx", line 208, in asyncpg.pgproto.pgproto.timestamptz_encode
+TypeError: expected a datetime.date or datetime.datetime instance, got 'str'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 74, in _process_projector
+    await projector.handle_event(event_dict, conn)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\application_summary.py", line 101, in handle_event
+    await conn.execute("UPDATE application_summary_view SET state = $2, final_decision_at = $3 WHERE application_id = $1", app_id, state, dt_str)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 357, in execute
+    _, status, _ = await self._execute(
+                   ^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1873, in _execute
+    result, _ = await self.__execute(
+                ^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1970, in __execute
+    result, stmt = await self._do_execute(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 2033, in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "asyncpg/protocol/protocol.pyx", line 184, in bind_execute
+  File "asyncpg/protocol/prepared_stmt.pyx", line 204, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+asyncpg.exceptions.DataError: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+Traceback (most recent call last):
+  File "asyncpg/protocol/prepared_stmt.pyx", line 175, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+  File "asyncpg/protocol/codecs/base.pyx", line 251, in asyncpg.protocol.protocol.Codec.encode
+  File "asyncpg/protocol/codecs/base.pyx", line 153, in asyncpg.protocol.protocol.Codec.encode_scalar
+  File "asyncpg/pgproto/codecs/datetime.pyx", line 208, in asyncpg.pgproto.pgproto.timestamptz_encode
+TypeError: expected a datetime.date or datetime.datetime instance, got 'str'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 74, in _process_projector
+    await projector.handle_event(event_dict, conn)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\application_summary.py", line 101, in handle_event
+    await conn.execute("UPDATE application_summary_view SET state = $2, final_decision_at = $3 WHERE application_id = $1", app_id, state, dt_str)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 357, in execute
+    _, status, _ = await self._execute(
+                   ^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1873, in _execute
+    result, _ = await self.__execute(
+                ^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1970, in __execute
+    result, stmt = await self._do_execute(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 2033, in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "asyncpg/protocol/protocol.pyx", line 184, in bind_execute
+  File "asyncpg/protocol/prepared_stmt.pyx", line 204, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+asyncpg.exceptions.DataError: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+ERROR    ledger.projections.daemon:daemon.py:58 Daemon loop error: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+Traceback (most recent call last):
+  File "asyncpg/protocol/prepared_stmt.pyx", line 175, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+  File "asyncpg/protocol/codecs/base.pyx", line 251, in asyncpg.protocol.protocol.Codec.encode
+  File "asyncpg/protocol/codecs/base.pyx", line 153, in asyncpg.protocol.protocol.Codec.encode_scalar
+  File "asyncpg/pgproto/codecs/datetime.pyx", line 208, in asyncpg.pgproto.pgproto.timestamptz_encode
+TypeError: expected a datetime.date or datetime.datetime instance, got 'str'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 52, in _run_loop
+    await self._process_projector(projector)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\daemon.py", line 74, in _process_projector
+    await projector.handle_event(event_dict, conn)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\projections\application_summary.py", line 101, in handle_event
+    await conn.execute("UPDATE application_summary_view SET state = $2, final_decision_at = $3 WHERE application_id = $1", app_id, state, dt_str)
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 357, in execute
+    _, status, _ = await self._execute(
+                   ^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1873, in _execute
+    result, _ = await self.__execute(
+                ^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 1970, in __execute
+    result, stmt = await self._do_execute(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Lib\site-packages\asyncpg\connection.py", line 2033, in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "asyncpg/protocol/protocol.pyx", line 184, in bind_execute
+  File "asyncpg/protocol/prepared_stmt.pyx", line 204, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
+asyncpg.exceptions.DataError: invalid input for query argument $3: '2026-03-10T03:53:08.440091' (expected a datetime.date or datetime.datetime instance, got 'str')
+============================== warnings summary ===============================
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+  C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py:152: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_phase3.py::test_projection_daemon_flow - AssertionError: Pr...
+======================= 1 failed, 6 warnings in 40.94s ========================

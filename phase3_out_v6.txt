@@ -1,0 +1,18 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_phase3.py::test_projection_daemon_flow PASSED                 [100%]
+
+============================== warnings summary ===============================
+tests/test_phase3.py::test_projection_daemon_flow
+  C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\tests\test_phase3.py:130: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    state = await compliance_projector.get_state_at(app_id, datetime.utcnow(), conn)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 1 passed, 1 warning in 35.67s ========================

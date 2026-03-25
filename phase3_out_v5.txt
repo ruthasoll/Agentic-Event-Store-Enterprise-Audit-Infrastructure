@@ -1,0 +1,113 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_phase3.py::test_projection_daemon_flow FAILED                 [100%]
+
+================================== FAILURES ===================================
+_________________________ test_projection_daemon_flow _________________________
+
+store = <ledger.event_store.EventStore object at 0x0000016175555A90>
+db_pool = <asyncpg.pool.Pool object at 0x0000016175382800>
+
+    @pytest.mark.asyncio
+    async def test_projection_daemon_flow(store, db_pool):
+        # 1. Setup projectors
+        app_projector = ApplicationSummaryProjector()
+        agent_projector = AgentPerformanceLedgerProjector()
+        compliance_projector = ComplianceAuditView(store)
+    
+        projectors = [app_projector, agent_projector, compliance_projector]
+    
+        # 2. Clear old data for a clean test
+        async with db_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS application_summary_view")
+            await conn.execute("DROP TABLE IF EXISTS agent_performance_view")
+            await conn.execute("DROP TABLE IF EXISTS compliance_audit_snapshots")
+            await conn.execute("DELETE FROM projection_checkpoints")
+            await conn.execute("DELETE FROM outbox")
+            await conn.execute("DELETE FROM events")
+            await conn.execute("DELETE FROM event_streams")
+    
+        # 3. Start Daemon
+        daemon = ProjectionDaemon(store, db_pool, projectors, batch_size=10, poll_interval=0.1)
+        await daemon.start()
+    
+        try:
+            # 4. Append events
+            app_id = "TEST-APP-001"
+            await store.append(f"loan-{app_id}", [
+                {"event_type": "ApplicationSubmitted", "payload": {"application_id": app_id, "applicant_id": "C-1", "requested_amount_usd": 50000}},
+                {"event_type": "DocumentUploadRequested", "payload": {"application_id": app_id}}
+            ], expected_version=-1)
+    
+            await store.append(f"agent-doc-1", [
+                {"event_type": "AgentSessionStarted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "application_id": app_id}},
+                {"event_type": "AgentSessionCompleted", "payload": {"session_id": "S-1", "agent_type": "document_processing", "agent_id": "doc-1", "total_nodes_executed": 5, "total_tokens_used": 1000, "total_cost_usd": 0.01, "total_duration_ms": 500}}
+            ], expected_version=-1)
+    
+            await store.append(f"compliance-{app_id}", [
+                {"event_type": "ComplianceCheckRequested", "payload": {"application_id": app_id, "rules_to_evaluate": ["RULE-1", "RULE-2"]}},
+                {"event_type": "ComplianceRulePassed", "payload": {"application_id": app_id, "rule_id": "RULE-1"}}
+            ], expected_version=-1)
+    
+            # 5. Wait for daemon to process
+            wait_loops = 0
+            while wait_loops < 20:
+                lags = await daemon.get_lag()
+                if all(lag == 0 for lag in lags.values()):
+                    break
+                await asyncio.sleep(0.2)
+                wait_loops += 1
+    
+            lags = await daemon.get_lag()
+            assert all(lag == 0 for lag in lags.values()), f"Projections still lagging: {lags}"
+    
+            # 6. Verify Application Summary
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM application_summary_view WHERE application_id = $1", app_id)
+                assert row is not None
+                assert row["state"] == "COMPLIANCE_CHECK_REQUESTED"
+                assert row["requested_amount_usd"] == 50000
+    
+                # Verify Agent Performance
+                agent_row = await conn.fetchrow("SELECT * FROM agent_performance_view WHERE agent_id = $1", "doc-1")
+                assert agent_row is not None
+                assert agent_row["total_sessions"] == 1
+                assert agent_row["total_tokens"] == 1000
+                assert float(agent_row["total_cost_usd"]) == 0.01
+    
+            # 7. Test Rebuild
+            await daemon.rebuild("application_summary")
+            # In this simplistic impl, rebuild just resets checkpoint. We need to wait for it to re-process.
+            # To truly test rebuild we should have deleted the view data first, but our rebuild() doesn't do that yet.
+            # Let's verify the lag went up.
+            lags = await daemon.get_lag()
+            assert lags["application_summary"] > 0
+    
+            # Wait for it to catch up again
+            await asyncio.sleep(1)
+            lags = await daemon.get_lag()
+>           assert lags["application_summary"] == 0
+E           assert 1241 == 0
+
+tests\test_phase3.py:107: AssertionError
+============================== warnings summary ===============================
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+tests/test_phase3.py::test_projection_daemon_flow
+  C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\ledger\event_store.py:152: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_phase3.py::test_projection_daemon_flow - assert 1241 == 0
+======================= 1 failed, 6 warnings in 31.62s ========================

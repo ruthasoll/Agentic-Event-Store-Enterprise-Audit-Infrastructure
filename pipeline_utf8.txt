@@ -1,6 +1,41 @@
-﻿Processing APEX-0007 through phase: all
---- Running DocumentProcessingAgent ---
-Document processing complete! Verified Output written to Events.
+﻿============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collected 0 items
 
---- Running CreditAnalysisAgent ---
-Credit analysis failed: 
+============================ no tests ran in 0.46s ============================
+.\.venv\Scripts\python 
+: ERROR: not found: C:\
+Users\stsio\OneDrive\De
+sktop\TRP-Ruth\Agentic-
+Event-Store-Enterprise-
+Audit-Infrastructure\te
+sts\test_narratives.py:
+:test_narr02
+At line:1 char:1
++ 
+.\.venv\Scripts\python 
+-m pytest tests/test_na
+rratives.py::test_narr0
+ ...
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (ERROR: not fo   
+ un...py::test_narr    
+02:String) [], Rem    
+oteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+(no match in any of 
+[<Module 
+test_narratives.py>])
+

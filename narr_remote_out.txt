@@ -1,0 +1,51 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.7, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\stsio\OneDrive\Desktop\TRP-Ruth\Agentic-Event-Store-Enterprise-Audit-Infrastructure
+configfile: pytest.ini
+plugins: anyio-4.13.0, Faker-25.9.2, langsmith-0.7.22, asyncio-0.24.0
+asyncio: mode=Mode.AUTO, default_loop_scope=None
+collecting ... collected 1 item
+
+tests/test_narratives.py::test_narr02_document_extraction_failure FAILED [100%]
+
+================================== FAILURES ===================================
+___________________ test_narr02_document_extraction_failure ___________________
+
+store = <ledger.event_store.EventStore object at 0x00000206B5A874D0>
+registry = <ledger.registry.client.ApplicantRegistryClient object at 0x00000206B5A878C0>
+
+    @pytest.mark.asyncio
+    async def test_narr02_document_extraction_failure(store, registry):
+        # NARR-02: EBITDA field is missing from documents.
+        # DocumentProcessingAgent must flag quality exception.
+        app_id = f"NARR-02-{uuid4().hex[:8]}"
+    
+>       await store.append(f"loan-{app_id}", [{
+            "event_type": "ApplicationSubmitted",
+            "payload": {"application_id": app_id, "applicant_id": "COMP-TEST", "requested_amount_usd": 100000}
+        }], expected_version=-1)
+
+tests\test_narratives.py:72: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+ledger\event_store.py:118: in append
+    row = await conn.fetchrow(
+.venv\Lib\site-packages\asyncpg\connection.py:752: in fetchrow
+    data = await self._execute(
+.venv\Lib\site-packages\asyncpg\connection.py:1873: in _execute
+    result, _ = await self.__execute(
+.venv\Lib\site-packages\asyncpg\connection.py:1970: in __execute
+    result, stmt = await self._do_execute(
+.venv\Lib\site-packages\asyncpg\connection.py:2013: in _do_execute
+    stmt = await self._get_statement(
+.venv\Lib\site-packages\asyncpg\connection.py:443: in _get_statement
+    statement = await self._protocol.prepare(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+>   ???
+E   asyncpg.exceptions.UndefinedTableError: relation "event_streams" does not exist
+
+asyncpg/protocol/protocol.pyx:165: UndefinedTableError
+=========================== short test summary info ===========================
+FAILED tests/test_narratives.py::test_narr02_document_extraction_failure - as...
+============================== 1 failed in 9.13s ==============================
