@@ -10,8 +10,8 @@ COMPLETION CHECKLIST (implement in order):
 """
 from __future__ import annotations
 import json
-from datetime import datetime
-from typing import AsyncGenerator
+from datetime import datetime, UTC
+from typing import AsyncGenerator, Callable, Any, List
 from uuid import UUID
 import asyncpg
 from ledger.schema.events import StoredEvent, StreamMetadata
@@ -51,11 +51,13 @@ class EventStore:
         """
         Returns current version, or -1 if stream doesn't exist.
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT current_version FROM event_streams WHERE stream_id = $1",
                 stream_id)
             return row["current_version"] if row else -1
+        raise RuntimeError("Failed to get stream version")
 
     async def append(
         self,
@@ -103,7 +105,7 @@ class EventStore:
                         event["event_type"], event["event_version"],
                         json.dumps(event["payload"]),
                         json.dumps(meta),
-                        datetime.utcnow())
+                        datetime.now(UTC))
                     positions.append(pos)
 
                 # 5. Update stream version
@@ -112,6 +114,7 @@ class EventStore:
                     expected_version + len(events), stream_id)
                 return positions
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 # 1. Lock stream row
@@ -149,7 +152,7 @@ class EventStore:
                         event["event_type"], event.get("event_version", 1),
                         json.dumps(event.get("payload", {})),
                         json.dumps(meta),
-                        datetime.utcnow())
+                        datetime.now(UTC))
                     positions.append(pos)
                     
                     # 4.5 Insert outbox entry natively
@@ -164,18 +167,20 @@ class EventStore:
                     "UPDATE event_streams SET current_version=$1 WHERE stream_id=$2",
                     expected_version + len(events), stream_id)
                 return positions
+        raise RuntimeError("Failed to append events")
 
     async def load_stream(
         self,
         stream_id: str,
         from_position: int = 0,
         to_position: int | None = None,
-    ) -> list[dict]:
+    ) -> list[StoredEvent]:
         """
         Loads events from a stream in stream_position order.
         Applies upcasters if self.upcasters is set.
 
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             q = ("SELECT event_id, stream_id, stream_position, event_type,"
                  " event_version, payload, metadata, recorded_at"
@@ -192,20 +197,22 @@ class EventStore:
                 if self.upcasters: e = self.upcasters.upcast(e)
                 events.append(StoredEvent(**e))
             return events
+        raise RuntimeError("Failed to load stream")
 
     async def load_all(
         self, from_position: int = 0, batch_size: int = 500
-    ) -> AsyncGenerator[dict, None]:
+    ) -> AsyncGenerator[StoredEvent, None]:
         """
         Async generator yielding all events by global_position.
         Used by the ProjectionDaemon.
 
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             pos = from_position
             while True:
-                rows = await conn.fetch(
-                    "SELECT global_position, stream_id, stream_position,"
+                rows: List[Any] = await conn.fetch(
+                    "SELECT global_position, event_id, stream_id, stream_position,"
                     " event_type, event_version, payload, metadata, recorded_at"
                     " FROM events WHERE global_position > $1"
                     " ORDER BY global_position ASC LIMIT $2",
@@ -218,23 +225,27 @@ class EventStore:
                     yield StoredEvent(**e)
                 pos = rows[-1]["global_position"]
                 if len(rows) < batch_size: break
+        # No return needed for AsyncGenerator path completion
 
-    async def get_event(self, event_id: UUID) -> dict | None:
+    async def get_event(self, event_id: UUID) -> StoredEvent | None:
         """
         Loads one event by UUID. Used for causation chain lookups.
 
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM events WHERE event_id=$1", event_id)
             if not row: return None
             return StoredEvent(**{**dict(row), "payload": json.loads(row["payload"]),
                                   "metadata": json.loads(row["metadata"])})
+        raise RuntimeError("Failed to get event")
 
     async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
         """
         Returns metadata for an event stream.
         """
+        if not self._pool: raise RuntimeError("EventStore not connected")
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM event_streams WHERE stream_id = $1",
@@ -248,6 +259,7 @@ class EventStore:
                 archived_at=row["archived_at"],
                 metadata=json.loads(row["metadata"])
             )
+        raise RuntimeError("Failed to get stream metadata")
 
     async def archive_stream(self, stream_id: str, expected_version: int) -> None:
         """
@@ -273,7 +285,7 @@ class EventStore:
                 # 2. Set archived_at
                 await conn.execute(
                     "UPDATE event_streams SET archived_at = $1 WHERE stream_id = $2",
-                    datetime.utcnow(), stream_id)
+                    datetime.now(UTC), stream_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,16 +307,11 @@ class UpcasterRegistry:
             return payload
 
     REQUIRED FOR PHASE 4:
-        - CreditAnalysisCompleted  v1 → v2  (adds model_versions: dict)
         - DecisionGenerated        v1 → v2  (adds model_versions: dict)
-
-    IMMUTABILITY TEST (required artifact):
-        registry.assert_upcaster_does_not_write_to_db(store, event)
-        # Loads the event, upcasts it, re-loads it, confirms DB row unchanged.
     """
 
     def __init__(self):
-        self._upcasters: dict[str, dict[int, callable]] = {}
+        self._upcasters: dict[str, dict[int, Callable]] = {}
 
     def upcaster(self, event_type: str, from_version: int, to_version: int):
         def decorator(fn):
@@ -396,7 +403,7 @@ class InMemoryEventStore:
                     "event_version": event.get("event_version", 1),
                     "payload": dict(event.get("payload", {})),
                     "metadata": meta,
-                    "recorded_at": _datetime.utcnow().isoformat(),
+                    "recorded_at": _datetime.now(UTC).isoformat(),
                 }
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
@@ -404,6 +411,7 @@ class InMemoryEventStore:
 
             self._versions[stream_id] = current + len(events)
             return positions
+        return []
 
     async def load_stream(
         self,
@@ -418,7 +426,7 @@ class InMemoryEventStore:
         ]
         return [StoredEvent(**e) for e in sorted(events, key=lambda e: e["stream_position"])]
 
-    async def load_all(self, from_position: int = 0, batch_size: int = 500):
+    async def load_all(self, from_position: int = 0, batch_size: int = 500) -> AsyncGenerator[StoredEvent, None]:
         for e in self._global:
             if e["global_position"] >= from_position:
                 yield StoredEvent(**e)
