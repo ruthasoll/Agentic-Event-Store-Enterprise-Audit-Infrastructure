@@ -15,6 +15,7 @@ from typing import AsyncGenerator, Callable, Any, List
 from uuid import UUID
 import asyncpg
 from ledger.schema.events import StoredEvent, StreamMetadata
+from ledger.integrity import calculate_event_hash
 
 
 class OptimisticConcurrencyError(Exception):
@@ -137,6 +138,12 @@ class EventStore:
                         " VALUES($1, $2, 0)",
                         stream_id, stream_id.split("-")[0])
 
+                # 3. Get last event's hash for integrity chain
+                last_hash_row = await conn.fetchrow(
+                    "SELECT integrity_hash FROM events WHERE stream_id = $1 "
+                    "ORDER BY stream_position DESC LIMIT 1", stream_id)
+                prev_hash = last_hash_row["integrity_hash"] if last_hash_row else None
+
                 # 4. Insert each event
                 positions = []
                 meta = {**(metadata or {})}
@@ -144,16 +151,29 @@ class EventStore:
                 
                 for i, event in enumerate(events):
                     pos = expected_version + 1 + i
+                    payload = event.get("payload", {})
+                    event_type = event["event_type"]
+                    event_version = event.get("event_version", 1)
+                    
+                    # Calculate integrity hash
+                    integrity_hash = calculate_event_hash(
+                        prev_hash, stream_id, pos, event_type, event_version, payload, meta
+                    )
+                    
                     event_id = await conn.fetchval(
                         "INSERT INTO events(stream_id, stream_position, event_type,"
-                        " event_version, payload, metadata, recorded_at)"
-                        " VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7) RETURNING event_id",
+                        " event_version, payload, metadata, recorded_at, integrity_hash, previous_hash)"
+                        " VALUES($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9) RETURNING event_id",
                         stream_id, pos,
-                        event["event_type"], event.get("event_version", 1),
-                        json.dumps(event.get("payload", {})),
+                        event_type, event_version,
+                        json.dumps(payload),
                         json.dumps(meta),
-                        datetime.now(UTC))
+                        datetime.now(UTC),
+                        integrity_hash,
+                        prev_hash)
+                    
                     positions.append(pos)
+                    prev_hash = integrity_hash
                     
                     # 4.5 Insert outbox entry natively
                     await conn.execute(
@@ -237,8 +257,10 @@ class EventStore:
             row = await conn.fetchrow(
                 "SELECT * FROM events WHERE event_id=$1", event_id)
             if not row: return None
-            return StoredEvent(**{**dict(row), "payload": json.loads(row["payload"]),
-                                  "metadata": json.loads(row["metadata"])})
+            e = {**dict(row), "payload": json.loads(row["payload"]),
+                              "metadata": json.loads(row["metadata"])}
+            if self.upcasters: e = self.upcasters.upcast(e)
+            return StoredEvent(**e)
         raise RuntimeError("Failed to get event")
 
     async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
@@ -287,6 +309,35 @@ class EventStore:
                     "UPDATE event_streams SET archived_at = $1 WHERE stream_id = $2",
                     datetime.now(UTC), stream_id)
 
+    async def verify_stream_integrity(self, stream_id: str) -> bool:
+        """
+        Re-calculates the hash chain for a stream and returns True if valid.
+        """
+        if not self._pool: raise RuntimeError("EventStore not connected")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM events WHERE stream_id = $1 ORDER BY stream_position ASC",
+                stream_id)
+            
+            prev_hash = None
+            for row in rows:
+                if row["previous_hash"] != prev_hash:
+                    return False
+                
+                calc = calculate_event_hash(
+                    prev_hash,
+                    row["stream_id"],
+                    row["stream_position"],
+                    row["event_type"],
+                    row["event_version"],
+                    json.loads(row["payload"]),
+                    json.loads(row["metadata"])
+                )
+                if row["integrity_hash"] != calc:
+                    return False
+                prev_hash = calc
+            return True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UPCASTER REGISTRY — Phase 4
@@ -330,6 +381,24 @@ class UpcasterRegistry:
             event["event_version"] = v
         return event
 
+def get_default_upcaster_registry() -> UpcasterRegistry:
+    """Returns registry with Phase 4 standard upcasters."""
+    registry = UpcasterRegistry()
+
+    @registry.upcaster("DecisionGenerated", from_version=1, to_version=2)
+    def upcast_decision_v1_v2(payload: dict) -> dict:
+        # v2 adds model_versions dict
+        payload.setdefault("model_versions", {})
+        return payload
+
+    @registry.upcaster("CreditAnalysisCompleted", from_version=1, to_version=2)
+    def upcast_credit_v1_v2(payload: dict) -> dict:
+        # v2 adds regulatory_basis list
+        payload.setdefault("regulatory_basis", [])
+        return payload
+
+    return registry
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IN-MEMORY EVENT STORE — for tests only
@@ -354,11 +423,12 @@ class InMemoryEventStore:
     Same interface as EventStore — swap one for the other with no code changes.
     """
 
-    def __init__(self):
+    def __init__(self, upcaster_registry=None):
         # stream_id -> list of event dicts
         self._streams: dict[str, list[dict]] = _defaultdict(list)
         # stream_id -> current version (position of last event, -1 if empty)
         self._versions: dict[str, int] = {}
+        self.upcasters = upcaster_registry
         # global append log (ordered by insertion)
         self._global: list[dict] = []
         # projection checkpoints
@@ -394,16 +464,30 @@ class InMemoryEventStore:
 
             for i, event in enumerate(events):
                 pos = current + 1 + i
+                payload = dict(event.get("payload", {}))
+                event_type = event["event_type"]
+                event_version = event.get("event_version", 1)
+
+                # Fetch last hash for stream
+                stream_events = self._streams.get(stream_id, [])
+                last_hash = stream_events[-1]["integrity_hash"] if stream_events else None
+
+                integrity_hash = calculate_event_hash(
+                    last_hash, stream_id, pos, event_type, event_version, payload, meta
+                )
+
                 stored = {
                     "event_id": str(_uuid4()),
                     "stream_id": stream_id,
                     "stream_position": pos,
                     "global_position": len(self._global),
-                    "event_type": event["event_type"],
-                    "event_version": event.get("event_version", 1),
-                    "payload": dict(event.get("payload", {})),
+                    "event_type": event_type,
+                    "event_version": event_version,
+                    "payload": payload,
                     "metadata": meta,
                     "recorded_at": _datetime.now(UTC).isoformat(),
+                    "integrity_hash": integrity_hash,
+                    "previous_hash": last_hash,
                 }
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
@@ -424,17 +508,26 @@ class InMemoryEventStore:
             if e["stream_position"] >= from_position
             and (to_position is None or e["stream_position"] <= to_position)
         ]
-        return [StoredEvent(**e) for e in sorted(events, key=lambda e: e["stream_position"])]
+        sorted_events = sorted(events, key=lambda e: e["stream_position"])
+        if self.upcasters:
+            sorted_events = [self.upcasters.upcast(dict(e)) for e in sorted_events]
+        return [StoredEvent(**e) for e in sorted_events]
 
     async def load_all(self, from_position: int = 0, batch_size: int = 500) -> AsyncGenerator[StoredEvent, None]:
         for e in self._global:
             if e["global_position"] >= from_position:
-                yield StoredEvent(**e)
+                event_to_yield = dict(e)
+                if self.upcasters:
+                    event_to_yield = self.upcasters.upcast(event_to_yield)
+                yield StoredEvent(**event_to_yield)
 
     async def get_event(self, event_id: str) -> StoredEvent | None:
         for e in self._global:
             if e["event_id"] == str(event_id):
-                return StoredEvent(**e)
+                event_to_yield = dict(e)
+                if self.upcasters:
+                    event_to_yield = self.upcasters.upcast(event_to_yield)
+                return StoredEvent(**event_to_yield)
         return None
 
     async def get_stream_metadata(self, stream_id: str) -> StreamMetadata | None:
@@ -465,6 +558,21 @@ class InMemoryEventStore:
                 return
             
             self._archived[stream_id] = _datetime.utcnow()
+
+    async def verify_stream_integrity(self, stream_id: str) -> bool:
+        events = self._streams.get(stream_id, [])
+        prev_hash = None
+        for e in sorted(events, key=lambda x: x["stream_position"]):
+            if e["previous_hash"] != prev_hash:
+                return False
+            calc = calculate_event_hash(
+                prev_hash, e["stream_id"], e["stream_position"],
+                e["event_type"], e["event_version"], e["payload"], e["metadata"]
+            )
+            if e["integrity_hash"] != calc:
+                return False
+            prev_hash = calc
+        return True
 
     async def save_checkpoint(self, projection_name: str, position: int) -> None:
         self._checkpoints[projection_name] = position

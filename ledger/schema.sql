@@ -8,6 +8,8 @@ CREATE TABLE events (
   payload          JSONB NOT NULL,
   metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
   recorded_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  integrity_hash   TEXT,
+  previous_hash    TEXT,
   CONSTRAINT uq_stream_position UNIQUE (stream_id, stream_position)
 );
 
