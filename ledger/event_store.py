@@ -283,6 +283,22 @@ class EventStore:
             )
         raise RuntimeError("Failed to get stream metadata")
 
+    async def list_streams(self) -> list[StreamMetadata]:
+        """
+        Returns metadata for all streams in the store.
+        """
+        if not self._pool: raise RuntimeError("EventStore not connected")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM event_streams ORDER BY stream_id ASC")
+            return [StreamMetadata(
+                stream_id=row["stream_id"],
+                aggregate_type=row["aggregate_type"],
+                current_version=row["current_version"],
+                created_at=row["created_at"],
+                archived_at=row["archived_at"],
+                metadata=json.loads(row["metadata"])
+            ) for row in rows]
+
     async def archive_stream(self, stream_id: str, expected_version: int) -> None:
         """
         Archives a stream, preventing further appends.
@@ -547,6 +563,14 @@ class InMemoryEventStore:
                 archived_at=self._archived.get(stream_id),
                 metadata={}
             )
+
+    async def list_streams(self) -> list[StreamMetadata]:
+        async with _asyncio.Lock(): # Simple global lock for metadata listing
+            streams = []
+            for sid in self._streams.keys():
+                meta = await self.get_stream_metadata(sid)
+                if meta: streams.append(meta)
+            return sorted(streams, key=lambda x: x.stream_id)
 
     async def archive_stream(self, stream_id: str, expected_version: int) -> None:
         async with self._locks[stream_id]:
