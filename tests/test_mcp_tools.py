@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from ledger.event_store import InMemoryEventStore, get_default_upcaster_registry
-from ledger.mcp_server import inspect_loan_history, verify_audit_trail, get_compliance_summary
+from ledger.mcp_server import inspect_loan_history, run_integrity_check, get_compliance_summary
 import ledger.mcp_server
 
 @pytest.mark.asyncio
@@ -28,8 +28,8 @@ async def test_mcp_tool_logic():
     assert len(history) == 1
     assert history[0]["event_type"] == "ApplicationSubmitted"
     
-    # 3. Test verify_audit_trail
-    verify = await verify_audit_trail(stream_id)
+    # 3. Test run_integrity_check
+    verify = await run_integrity_check(stream_id)
     assert verify["integrity_check_passed"] is True
     assert verify["stream_id"] == stream_id
     

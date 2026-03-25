@@ -2,8 +2,24 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from pydantic import BaseModel, Field
 from ledger.event_store import EventStore, OptimisticConcurrencyError
-from ledger.schema.events import AgentSessionStarted, AgentSessionCompleted, AgentSessionFailed, AgentType
+from ledger.schema.events import (
+    AgentSessionStarted, AgentSessionCompleted, AgentSessionFailed, 
+    AgentSessionRecovered, AgentType, StoredEvent
+)
+
+class AgentContext(BaseModel):
+    """Structured memory for the Gas Town pattern."""
+    session_id: str
+    agent_id: str
+    application_id: str
+    agent_type: AgentType
+    last_event_position: int = -1
+    nodes_executed: List[str] = Field(default_factory=list)
+    tools_called: List[Dict[str, Any]] = Field(default_factory=list)
+    pending_work: Dict[str, Any] = Field(default_factory=dict)
+    is_recovered: bool = False
 
 class BaseApexAgent:
     """
@@ -28,28 +44,89 @@ class BaseApexAgent:
             clean = clean[:-3]
         return json.loads(clean.strip())
 
-    async def start_session(self, application_id: str, context: dict = None) -> str:
-        self.application_id = application_id
+    async def reconstruct_agent_context(self, application_id: str) -> AgentContext:
+        """
+        Replays the agent's dedicated stream to rebuild its context.
+        Detects if a session was interrupted (Gas Town pattern).
+        """
         stream_id = f"agent-{self.agent_id}-{application_id}"
         events = await self.store.load_stream(stream_id)
         
-        ctx_source = "new_invocation"
-        if events:
-            starts = [e for e in events if e["event_type"] == "AgentSessionStarted"]
-            ends = [e for e in events if e["event_type"] == "AgentSessionCompleted"]
-            if len(starts) > len(ends):
-                prior_id = starts[-1]["payload"]["session_id"]
-                ctx_source = f"prior_session_replay: {prior_id}"
+        if not events:
+            return AgentContext(
+                session_id=self.session_id,
+                agent_id=self.agent_id,
+                application_id=application_id,
+                agent_type=self.agent_type
+            )
+        
+        # We look for the MOST RECENT session
+        # Find the last 'AgentSessionStarted' event
+        start_indices = [i for i, e in enumerate(events) if e.event_type == "AgentSessionStarted"]
+        if not start_indices:
+            return AgentContext(session_id=self.session_id, agent_id=self.agent_id, application_id=application_id, agent_type=self.agent_type)
+        
+        last_start_idx = start_indices[-1]
+        session_events = events[last_start_idx:]
+        start_event = session_events[0]
+        
+        # Check if session completed
+        is_completed = any(e.event_type in ("AgentSessionCompleted", "AgentSessionFailed") for e in session_events)
+        
+        ctx = AgentContext(
+            session_id=start_event.payload["session_id"],
+            agent_id=self.agent_id,
+            application_id=application_id,
+            agent_type=self.agent_type,
+            last_event_position=events[-1].stream_position,
+            is_recovered=not is_completed
+        )
+        
+        for e in session_events:
+            if e.event_type == "AgentNodeExecuted":
+                ctx.nodes_executed.append(e.payload["node_name"])
+            elif e.event_type == "AgentToolCalled":
+                ctx.tools_called.append(e.payload)
                 
+        # Detect Partial Decision:
+        # If the last node was the decision node but no completion, it's pending output.
+        if ctx.is_recovered and ctx.nodes_executed:
+            last_node = ctx.nodes_executed[-1]
+            if "decision" in last_node.lower() or "orchestrate" in last_node.lower():
+                ctx.pending_work["partial_decision_detected"] = True
+                
+        return ctx
+
+    async def start_session(self, application_id: str, context: dict = None) -> str:
+        self.application_id = application_id
+        
+        # RECONSTRUCT CONTEXT (Gas Town Recovery)
+        recovered_ctx = await self.reconstruct_agent_context(application_id)
+        
+        if recovered_ctx.is_recovered:
+            # We are resuming!
+            self.session_id = recovered_ctx.session_id
+            ev = AgentSessionRecovered(
+                session_id=self.session_id,
+                agent_type=self.agent_type,
+                application_id=application_id,
+                recovered_from_session_id=recovered_ctx.session_id,
+                recovery_point=recovered_ctx.nodes_executed[-1] if recovered_ctx.nodes_executed else "start",
+                recovered_at=datetime.now(timezone.utc)
+            )
+            await self._append_to_agent_stream(application_id, [ev.to_store_dict()])
+            return self.session_id
+
+        # Else start new session
         payload = {
             "session_id": self.session_id,
             "agent_type": self.agent_type,
             "agent_id": self.agent_id,
             "application_id": application_id,
             "model_version": self.model_version,
-            "langgraph_graph_version": "1.0.0", # Simplified
-            "context_source": ctx_source,
-            "context_token_count": 0 # Simplified
+            "langgraph_graph_version": "1.0.0",
+            "context_source": "new_invocation",
+            "context_token_count": 0
         }
         if context: payload.update(context)
         

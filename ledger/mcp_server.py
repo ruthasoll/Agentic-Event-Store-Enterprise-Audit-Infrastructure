@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from fastmcp import FastMCP
 from dotenv import load_dotenv
 from ledger.event_store import EventStore, get_default_upcaster_registry
+from ledger.mcp.resources import register_resources
 
 # Load environment variables (.env)
 load_dotenv()
@@ -23,47 +24,81 @@ async def get_store():
             raise ValueError("DATABASE_URL not set in environment")
         _store = EventStore(db_url, upcaster_registry=get_default_upcaster_registry())
         await _store.connect()
+        # Register resources from the shared module
+        register_resources(mcp, _store)
     return _store
+
+def format_error(e: Exception, suggested_action: str) -> Dict[str, Any]:
+    """Uniform structured error response for LLM consumability."""
+    return {
+        "error": str(e),
+        "error_type": type(e).__name__,
+        "suggested_action": suggested_action
+    }
 
 @mcp.tool()
 async def list_auditable_entities() -> List[Dict[str, Any]]:
     """
     Returns a list of all auditable event streams (loans, agents, compliance, etc.) 
     with their metadata.
+    
+    Preconditions:
+    - EventStore must be connected to a valid Postgres database.
     """
-    store = await get_store()
-    streams = await store.list_streams()
-    return [s.model_dump(mode='json') for s in streams]
+    try:
+        store = await get_store()
+        streams = await store.list_streams()
+        return [s.model_dump(mode='json') for s in streams]
+    except Exception as e:
+        return format_error(e, "Check DATABASE_URL and ensure Postgres is reachable.")
 
 @mcp.tool()
-async def inspect_loan_history(application_id: str) -> List[Dict[str, Any]]:
+async def inspect_loan_history(application_id: str) -> List[Dict[str, Any]] | Dict[str, Any]:
     """
     Fetches the full event history for a specific loan application.
     Automatically applies upcasting to ensure all events are in the latest format.
+    
+    Preconditions:
+    - application_id must be a valid string identifier (e.g. 'APP-123').
     """
-    store = await get_store()
-    stream_id = f"loan-{application_id}"
-    events = await store.load_stream(stream_id)
-    return [e.model_dump(mode='json') for e in events]
+    try:
+        store = await get_store()
+        stream_id = f"loan-{application_id}"
+        events = await store.load_stream(stream_id)
+        if not events:
+            return format_error(ValueError(f"No stream found for {stream_id}"), 
+                                "Verify the application_id is correct or check if it was archived.")
+        return [e.model_dump(mode='json') for e in events]
+    except Exception as e:
+        return format_error(e, "Check if the stream ID format fits 'loan-{application_id}'.")
 
 @mcp.tool()
-async def verify_audit_trail(stream_id: str) -> Dict[str, Any]:
+async def run_integrity_check(stream_id: str) -> Dict[str, Any]:
     """
     Runs a cryptographic integrity check on a specific event stream.
     Re-calculates the SHA256 hash chain to verify no events have been tampered with.
+    
+    Preconditions:
+    - stream_id must exist in the event_streams table.
     """
-    store = await get_store()
-    is_valid = await store.verify_stream_integrity(stream_id)
-    
-    # Get stream metadata for context
-    meta = await store.get_stream_metadata(stream_id)
-    
-    return {
-        "stream_id": stream_id,
-        "integrity_check_passed": is_valid,
-        "current_version": meta.current_version if meta else None,
-        "verified_at": datetime.now().isoformat()
-    }
+    try:
+        store = await get_store()
+        is_valid = await store.verify_stream_integrity(stream_id)
+        
+        # Get stream metadata for context
+        meta = await store.get_stream_metadata(stream_id)
+        if not meta:
+            return format_error(ValueError(f"Stream {stream_id} not found"), 
+                                "List entities first to find a valid stream_id.")
+        
+        return {
+            "stream_id": stream_id,
+            "integrity_check_passed": is_valid,
+            "current_version": meta.current_version,
+            "verified_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return format_error(e, "Ensure the stream_id is fully qualified (e.g. 'loan-123' not '123').")
 
 @mcp.tool()
 async def get_compliance_summary(application_id: str) -> Dict[str, Any]:
